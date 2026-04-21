@@ -1,0 +1,27 @@
+[project]
+name = "medical-ops-middle-platform"
+version = "0.1.0"
+description = "Medical operations and process governance API service"
+requires-python = ">=3.11"
+dependencies = [
+  "fastapi>=0.115.0",
+  "uvicorn[standard]>=0.30.0",
+  "sqlalchemy>=2.0.32",
+  "psycopg[binary]>=3.2.1",
+  "pydantic-settings>=2.4.0",
+  "python-jose[cryptography]>=3.3.0",
+  "passlib[bcrypt]>=1.7.4",
+  "python-multipart>=0.0.9",
+  "alembic>=1.13.2",
+  "celery>=5.4.0",
+  "redis>=5.0.8",
+  "cryptography>=43.0.0",
+  "openpyxl>=3.1.5",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.3.2",
+  "pytest-asyncio>=0.24.0",
+  "ruff>=0.6.4",
+]
