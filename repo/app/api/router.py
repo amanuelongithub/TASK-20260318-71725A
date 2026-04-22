@@ -1,6 +1,6 @@
 from fastapi import APIRouter
 
-from app.api.v1 import audit, auth, data_governance, export, files, metrics, process, users, hospital
+from app.api.v1 import audit, auth, data_governance, dictionary, export, files, metrics, process, users, hospital
 
 api_router = APIRouter()
 api_router.include_router(auth.router, prefix="/auth", tags=["auth"])
@@ -12,3 +12,4 @@ api_router.include_router(audit.router, prefix="/audit", tags=["audit"])
 api_router.include_router(data_governance.router, prefix="/data-governance", tags=["data-governance"])
 api_router.include_router(files.router, prefix="/files", tags=["files"])
 api_router.include_router(hospital.router, prefix="/hospital", tags=["hospital"])
+api_router.include_router(dictionary.router, prefix="/dictionary", tags=["dictionary"])

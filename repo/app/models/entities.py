@@ -94,8 +94,7 @@ class ProcessStatus(str, Enum):
 class ProcessInstance(Base):
     __tablename__ = "process_instances"
     __table_args__ = (
-        UniqueConstraint("org_id", "idempotency_key", name="uq_org_idempotency"),
-        UniqueConstraint("org_id", "business_id", name="uq_org_business_id"),
+        # Permanent unique constraint on org_id and idempotency_key removed to support 24-hour window.
     )
 
     id: Mapped[int] = mapped_column(primary_key=True)
@@ -107,8 +106,9 @@ class ProcessInstance(Base):
     business_id: Mapped[str] = mapped_column(String(128), index=True)
     idempotency_key: Mapped[str] = mapped_column(String(128), index=True)
     variables: Mapped[dict] = mapped_column(JSON, default=dict)
-    sla_due_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    sla_due_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True, index=True)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True, index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, index=True)
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
@@ -132,9 +132,9 @@ class Task(Base):
     node_key: Mapped[str] = mapped_column(String(120), index=True)
     status: Mapped[TaskStatus] = mapped_column(SAEnum(TaskStatus), default=TaskStatus.PENDING)
     comment: Mapped[str | None] = mapped_column(Text, nullable=True)
-    completed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
-    sla_due_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True, index=True)
+    sla_due_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True, index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, index=True)
 
 
 class MetricsSnapshot(Base):
@@ -163,7 +163,7 @@ class AuditLog(Base):
     actor_id: Mapped[int | None] = mapped_column(ForeignKey("users.id"), nullable=True)
     event: Mapped[str] = mapped_column(String(120), index=True)
     event_metadata: Mapped[dict] = mapped_column(JSON)
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, index=True)
 
 
 from sqlalchemy import event
@@ -220,8 +220,8 @@ class Attachment(Base):
     __tablename__ = "attachments"
 
     id: Mapped[int] = mapped_column(primary_key=True)
-    org_id: Mapped[int] = mapped_column(ForeignKey("organizations.id"), index=True)
-    uploader_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True)
+    org_id: Mapped[int] = mapped_column(ForeignKey("organizations.id", ondelete="CASCADE"), index=True)
+    uploader_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
     filename: Mapped[str] = mapped_column(String(255))
     file_size: Mapped[int] = mapped_column(Integer)
     sha256: Mapped[str] = mapped_column(String(64), index=True)
@@ -229,6 +229,21 @@ class Attachment(Base):
     business_owner_id: Mapped[str | None] = mapped_column(String(128), nullable=True, index=True)
     task_id: Mapped[int | None] = mapped_column(ForeignKey("tasks.id"), nullable=True, index=True)
     process_instance_id: Mapped[int | None] = mapped_column(ForeignKey("process_instances.id"), nullable=True, index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+
+class OrganizationInvitation(Base):
+    __tablename__ = "organization_invitations"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    org_id: Mapped[int] = mapped_column(ForeignKey("organizations.id", ondelete="CASCADE"), index=True)
+    email_or_username: Mapped[str] = mapped_column(String(255), index=True)
+    role_id: Mapped[int] = mapped_column(ForeignKey("roles.id"), index=True)
+    token_hash: Mapped[str] = mapped_column(String(128), unique=True, index=True)
+    expires_at: Mapped[datetime] = mapped_column(DateTime)
+    used_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    revoked_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    created_by: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
 
@@ -240,6 +255,18 @@ class AuditLogBatchSignature(Base):
     last_log_id: Mapped[int] = mapped_column(Integer)
     batch_hash: Mapped[str] = mapped_column(String(64))
     signature: Mapped[str] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+
+class DataDictionaryEntry(Base):
+    __tablename__ = "data_dictionary_entries"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    entity: Mapped[str] = mapped_column(String(64), index=True)
+    field_name: Mapped[str] = mapped_column(String(64), index=True)
+    description: Mapped[str] = mapped_column(Text)
+    field_type: Mapped[str] = mapped_column(String(64))
+    sensitivity: Mapped[str] = mapped_column(String(32))
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
 
@@ -259,32 +286,64 @@ class ImportBatchDetail(Base):
 
 class Patient(Base):
     __tablename__ = "patients"
-    __table_args__ = (UniqueConstraint("org_id", "patient_number", name="uq_org_patient_num"),)
+    __table_args__ = (UniqueConstraint("org_id", "patient_number_hash", name="uq_org_patient_num"),)
 
     id: Mapped[int] = mapped_column(primary_key=True)
-    org_id: Mapped[int] = mapped_column(ForeignKey("organizations.id"), index=True)
+    org_id: Mapped[int] = mapped_column(ForeignKey("organizations.id", ondelete="CASCADE"), index=True)
     user_id: Mapped[int | None] = mapped_column(ForeignKey("users.id"), nullable=True, index=True)
-    patient_number: Mapped[str] = mapped_column(String(64), index=True)
+    
+    # SECURITY: patient_number is encrypted, patient_number_hash is for O(1) loopkup
+    patient_number_encrypted: Mapped[bytes] = mapped_column(LargeBinary)
+    patient_number_hash: Mapped[str] = mapped_column(String(128), index=True)
 
     full_name: Mapped[str] = mapped_column(String(255))
     dob: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     phone_number_encrypted: Mapped[bytes | None] = mapped_column(LargeBinary, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
+    @property
+    def patient_number(self) -> str:
+        if not self.patient_number_encrypted:
+            return ""
+        from app.core.security import decrypt_field
+        return decrypt_field(self.patient_number_encrypted)
+
+    @patient_number.setter
+    def patient_number(self, value: str):
+        from app.core.security import encrypt_field, deterministic_hash
+        self.patient_number_encrypted = encrypt_field(value)
+        self.patient_number_hash = deterministic_hash(value)
+
 
 class Doctor(Base):
     __tablename__ = "doctors"
-    __table_args__ = (UniqueConstraint("org_id", "license_number", name="uq_org_license_num"),)
+    __table_args__ = (UniqueConstraint("org_id", "license_number_hash", name="uq_org_license_num"),)
 
     id: Mapped[int] = mapped_column(primary_key=True)
-    org_id: Mapped[int] = mapped_column(ForeignKey("organizations.id"), index=True)
+    org_id: Mapped[int] = mapped_column(ForeignKey("organizations.id", ondelete="CASCADE"), index=True)
     user_id: Mapped[int | None] = mapped_column(ForeignKey("users.id"), nullable=True, index=True)
-    license_number: Mapped[str] = mapped_column(String(64), index=True)
+    
+    # SECURITY: license_number is encrypted, license_number_hash is for O(1) lookup
+    license_number_encrypted: Mapped[bytes] = mapped_column(LargeBinary)
+    license_number_hash: Mapped[str] = mapped_column(String(128), index=True)
 
     full_name: Mapped[str] = mapped_column(String(255))
     specialty: Mapped[str | None] = mapped_column(String(120), nullable=True)
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+    @property
+    def license_number(self) -> str:
+        if not self.license_number_encrypted:
+            return ""
+        from app.core.security import decrypt_field
+        return decrypt_field(self.license_number_encrypted)
+
+    @license_number.setter
+    def license_number(self, value: str):
+        from app.core.security import encrypt_field, deterministic_hash
+        self.license_number_encrypted = encrypt_field(value)
+        self.license_number_hash = deterministic_hash(value)
 
 
 class Appointment(Base):
@@ -300,6 +359,7 @@ class Appointment(Base):
     status: Mapped[str] = mapped_column(String(32), default="scheduled")
     scheduled_time: Mapped[datetime] = mapped_column(DateTime)
     notes: Mapped[str | None] = mapped_column(Text, nullable=True)
+    scheduled_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
 
@@ -316,7 +376,40 @@ class Expense(Base):
     status: Mapped[str] = mapped_column(String(32), default="pending")
     submitted_by: Mapped[int] = mapped_column(ForeignKey("users.id"))
     notes: Mapped[str| None] = mapped_column(Text, nullable=True)
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    approved_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, index=True)
+
+
+class ResourceApplication(Base):
+    __tablename__ = "resource_applications"
+    __table_args__ = (UniqueConstraint("org_id", "application_number", name="uq_org_resource_app_num"),)
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    org_id: Mapped[int] = mapped_column(ForeignKey("organizations.id"), index=True)
+    application_number: Mapped[str] = mapped_column(String(64), index=True)
+
+    resource_name: Mapped[str] = mapped_column(String(255))
+    quantity: Mapped[int] = mapped_column(Integer)
+    applicant_id: Mapped[int] = mapped_column(ForeignKey("users.id"))
+    status: Mapped[str] = mapped_column(String(32), default="pending", index=True)
+    approved_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, index=True)
+
+
+class CreditChange(Base):
+    __tablename__ = "credit_changes"
+    __table_args__ = (UniqueConstraint("org_id", "change_number", name="uq_org_credit_change_num"),)
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    org_id: Mapped[int] = mapped_column(ForeignKey("organizations.id"), index=True)
+    change_number: Mapped[str] = mapped_column(String(64), index=True)
+
+    target_user_id: Mapped[int] = mapped_column(ForeignKey("users.id"))
+    amount: Mapped[float] = mapped_column(Float)
+    reason: Mapped[str] = mapped_column(Text)
+    status: Mapped[str] = mapped_column(String(32), default="pending", index=True)
+    approved_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, index=True)
 
 
 class TokenBlacklist(Base):

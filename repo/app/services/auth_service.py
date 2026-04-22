@@ -4,8 +4,8 @@ from fastapi import HTTPException, status
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from app.core.security import create_access_token, decrypt_field, encrypt_field, get_password_hash, verify_password
-from app.models.entities import Organization, Role, RoleType, User
+from app.core.security import create_access_token, decrypt_field, deterministic_hash, encrypt_field, get_password_hash, verify_password
+from app.models.entities import Organization, OrganizationMembership, Role, RoleType, User, OrganizationInvitation
 from app.schemas.auth import LoginRequest, RegisterRequest
 from app.services.audit_service import log_event
 
@@ -14,18 +14,50 @@ LOCK_DURATION_MINUTES = 30
 
 
 def register(db: Session, payload: RegisterRequest) -> User:
-    # STRICT TENANT ISOLATION: Registration is ONLY for creating new organizations.
-    # Joining existing organizations must go through the authorized invitation path.
-    org_exists = db.scalar(select(Organization).where(Organization.org_code == payload.org_code))
-    if org_exists:
+    # STRICT TENANT ISOLATION: Registration is for:
+    # 1. Creating a brand new organization (standard registration)
+    # 2. Joining an existing organization ONLY with a valid invitation token.
+    
+    target_org = db.scalar(select(Organization).where(Organization.org_code == payload.org_code))
+    
+    invitation = None
+    if payload.invitation_token:
+        # Resolve invitation
+        token_hash = deterministic_hash(payload.invitation_token)
+        invitation = db.scalar(
+            select(OrganizationInvitation).where(
+                OrganizationInvitation.token_hash == token_hash,
+                OrganizationInvitation.revoked_at.is_(None),
+                OrganizationInvitation.used_at.is_(None)
+            )
+        )
+        if not invitation:
+            raise HTTPException(status_code=400, detail="Invalid, used, or revoked invitation token")
+        if invitation.expires_at < datetime.utcnow():
+            log_event(db, invitation.org_id, None, "auth.invitation_expired", {"invitation_id": invitation.id})
+            db.commit()
+            raise HTTPException(status_code=400, detail="Invitation token has expired")
+        
+        # Ensure org matches
+        if target_org and target_org.id != invitation.org_id:
+             raise HTTPException(status_code=400, detail="Invitation token does not match the organization code")
+        
+        # If invitation is valid but org.id doesn't match payload.org_code in DB, 
+        # it means the invitation is for an org that exists, so target_org SHOULD exist.
+        if not target_org:
+            target_org = db.scalar(select(Organization).where(Organization.id == invitation.org_id))
+    
+    elif target_org:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail="Conflict: Organization code already registered. To join an existing organization, please use an invitation link or contact your administrator."
         )
     
-    org = Organization(org_code=payload.org_code, name=payload.org_name)
-    db.add(org)
-    db.flush() # Ensure org.id is available for role checks
+    if not target_org:
+        # Create new organization
+        target_org = Organization(org_code=payload.org_code, name=payload.org_name)
+        db.add(target_org)
+        db.flush()
 
     admin_role = db.scalar(select(Role).where(Role.name == RoleType.ADMIN))
     if admin_role is None:
@@ -42,14 +74,19 @@ def register(db: Session, payload: RegisterRequest) -> User:
     if db.scalar(select(User).where(User.username == payload.username)):
         raise HTTPException(status_code=409, detail="Username already exists")
 
-    # If it's a brand new org, the first user is ADMIN. Otherwise, GENERAL_USER.
-    # Note: org.created_at check or simply checking if any users exist in org.
+    # If it's a brand new org, the first user is ADMIN. 
+    # If it's an invitation, we use the invitation role.
+    # Otherwise, GENERAL_USER.
     from sqlalchemy import func
-    user_count = db.scalar(select(func.count(User.id)).where(User.org_id == org.id))
-    assigned_role_id = admin_role.id if (user_count == 0) else general_role.id
+    user_count = db.scalar(select(func.count(User.id)).where(User.org_id == target_org.id))
+    
+    if invitation:
+        assigned_role_id = invitation.role_id
+    else:
+        assigned_role_id = admin_role.id if (user_count == 0) else general_role.id
 
     user = User(
-        org_id=org.id,
+        org_id=target_org.id,
         role_id=assigned_role_id,
         username=payload.username,
         full_name=payload.full_name,
@@ -59,10 +96,13 @@ def register(db: Session, payload: RegisterRequest) -> User:
     db.add(user)
     db.flush()
     
-    from app.models.entities import OrganizationMembership
-    db.add(OrganizationMembership(user_id=user.id, org_id=org.id))
+    db.add(OrganizationMembership(user_id=user.id, org_id=target_org.id, role_id=assigned_role_id))
     
-    log_event(db, org_id=org.id, actor_id=None, event="auth.register", metadata={"username": payload.username, "role": "admin" if user_count == 0 else "user"})
+    if invitation:
+        invitation.used_at = datetime.utcnow()
+        log_event(db, target_org.id, user.id, "auth.invitation_accepted", {"invitation_id": invitation.id})
+    
+    log_event(db, org_id=target_org.id, actor_id=None, event="auth.register", metadata={"username": payload.username, "role_id": assigned_role_id})
     db.commit()
     db.refresh(user)
     return user
@@ -149,7 +189,7 @@ def reset_password(db: Session, org_code: str, token: str, new_password: str) ->
     return True
 
 
-def join_organization(db: Session, actor: User, org_code: str) -> bool:
+def join_organization(db: Session, actor: User, org_code: str) -> dict:
     from app.models.entities import Organization, OrganizationMembership, Role, RoleType
     target_org = db.scalar(select(Organization).where(Organization.org_code == org_code))
     if not target_org:
@@ -169,23 +209,19 @@ def join_organization(db: Session, actor: User, org_code: str) -> bool:
             detail="You do not have a valid membership or invitation for this organization."
         )
     
-    # Update user's ACTIVE context to this organization.
-    # The role is now sourced from the membership table if available.
+    # Resolve effective role for this organization context
+    role_name = "general_user"
     if membership.role_id:
-        actor.role_id = membership.role_id
-    else:
-        # Fallback to general user if no specific role in this org
-        general_role = db.scalar(select(Role).where(Role.name == RoleType.GENERAL_USER))
-        if general_role:
-            actor.role_id = general_role.id
-    
-    actor.org_id = target_org.id
-    db.add(actor)
+        role = db.scalar(select(Role).where(Role.id == membership.role_id))
+        if role:
+            role_name = role.name.value
     log_event(db, target_org.id, actor.id, "auth.join_org", {"org_code": org_code})
     db.commit()
-    db.refresh(actor)
-
-    return actor
+    return {
+        "user_id": actor.id,
+        "org_id": target_org.id,
+        "role_name": role_name
+    }
 
 
 def logout_event(db: Session, actor: User, token_payload: dict) -> None:
@@ -201,4 +237,81 @@ def logout_event(db: Session, actor: User, token_payload: dict) -> None:
         db.add(TokenBlacklist(token_jti=jti, expires_at=expires_at))
         
     log_event(db, actor.org_id, actor.id, "auth.logout", {})
+    db.commit()
+
+
+def add_organization_member(db: Session, admin_actor: User, username: str, role_name: RoleType = RoleType.GENERAL_USER) -> OrganizationMembership:
+    # Verify target user exists
+    target_user = db.scalar(select(User).where(User.username == username))
+    if not target_user:
+        raise HTTPException(status_code=404, detail="User not found. To add a new user to the system, please use the invitation flow.")
+    
+    # Verify role exists
+    role = db.scalar(select(Role).where(Role.name == role_name))
+    if not role:
+        raise HTTPException(status_code=400, detail="Invalid role")
+    
+    # Check if already a member
+    existing = db.scalar(
+        select(OrganizationMembership).where(
+            OrganizationMembership.user_id == target_user.id,
+            OrganizationMembership.org_id == admin_actor.org_id
+        )
+    )
+    if existing:
+        if existing.is_active:
+            raise HTTPException(status_code=409, detail="User is already a member of this organization")
+        existing.is_active = True
+        existing.role_id = role.id
+        membership = existing
+    else:
+        membership = OrganizationMembership(
+            user_id=target_user.id,
+            org_id=admin_actor.org_id,
+            role_id=role.id,
+            is_active=True
+        )
+        db.add(membership)
+    
+    log_event(db, admin_actor.org_id, admin_actor.id, "auth.member_added", {"target_username": username, "role": role_name.value})
+    db.commit()
+    db.refresh(membership)
+    return membership
+
+
+def create_invitation(db: Session, admin: User, email_or_username: str, role_type: RoleType) -> tuple[OrganizationInvitation, str]:
+    import secrets
+    
+    role = db.scalar(select(Role).where(Role.name == role_type))
+    if not role:
+        raise HTTPException(status_code=400, detail="Invalid role")
+        
+    token = secrets.token_urlsafe(32)
+    token_hash = deterministic_hash(token)
+    
+    invitation = OrganizationInvitation(
+        org_id=admin.org_id,
+        email_or_username=email_or_username,
+        role_id=role.id,
+        token_hash=token_hash,
+        expires_at=datetime.utcnow() + timedelta(days=7),
+        created_by=admin.id
+    )
+    db.add(invitation)
+    log_event(db, admin.org_id, admin.id, "auth.invitation_created", {"target": email_or_username, "role": role_type.value})
+    db.commit()
+    db.refresh(invitation)
+    return invitation, token
+
+
+def revoke_invitation(db: Session, admin: User, invitation_id: int) -> None:
+    invitation = db.scalar(select(OrganizationInvitation).where(OrganizationInvitation.id == invitation_id, OrganizationInvitation.org_id == admin.org_id))
+    if not invitation:
+        raise HTTPException(status_code=404, detail="Invitation not found")
+    
+    if invitation.revoked_at or invitation.used_at:
+        raise HTTPException(status_code=400, detail="Invitation already processed or revoked")
+        
+    invitation.revoked_at = datetime.utcnow()
+    log_event(db, admin.org_id, admin.id, "auth.invitation_revoked", {"invitation_id": invitation_id})
     db.commit()

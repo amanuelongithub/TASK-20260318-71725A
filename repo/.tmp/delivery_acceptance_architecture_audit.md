@@ -1,197 +1,243 @@
 # Delivery Acceptance and Project Architecture Audit
 
 ## 1. Verdict
-- Overall conclusion: Fail
+- Overall conclusion: **Fail**
 
 ## 2. Scope and Static Verification Boundary
-- Reviewed: repository structure, `README.md`, config files, FastAPI entry points and routers, SQLAlchemy models, auth/RBAC/middleware, workflow/process, export, file/attachment, audit, data governance, metrics, migrations, and tests.
-- Not reviewed: real runtime behavior, live database state, network/TLS termination behavior, Celery execution, PostgreSQL trigger execution, backup/restore execution.
-- Intentionally not executed: project startup, tests, Docker, database migrations, workers, external services.
-- Manual verification required for: actual PostgreSQL migration success, HTTPS deployment wiring, Celery scheduling/retry behavior, backup/restore correctness, and any end-to-end flow that depends on a running DB or worker.
+- Reviewed: repository structure, README/config/manifests, FastAPI entry points and route registration, auth/RBAC/middleware, core services, SQLAlchemy models, Celery/scheduler code, migrations presence, and test files under `tests/`.
+- Not reviewed by execution: API startup, DB migrations against a live PostgreSQL instance, Celery workers/beat, Docker/Compose, HTTPS proxying, file IO behavior, or backup/restore commands.
+- Intentionally not executed: project startup, tests, Docker, external services, Redis, PostgreSQL, and browser/manual flows.
+- Manual verification required for: actual startup/run path, PostgreSQL/Alembic compatibility, Celery scheduling/execution, backup/restore jobs, HTTPS deployment behavior behind nginx, and any runtime claim that depends on external services or filesystem state.
 
 ## 3. Repository / Requirement Mapping Summary
-- Prompt goal: an offline FastAPI middle-platform API for identity, org isolation, four-tier RBAC, operations analysis/reporting, export traceability with desensitization, approval workflows with audit trail and idempotency, data governance/versioning/rollback/lineage, attachment governance, and security/compliance controls.
-- Mapped implementation areas: `app/api/v1/*`, `app/services/*`, `app/models/entities.py`, `app/middleware/auth.py`, `app/tasks/jobs.py`, `alembic/versions/*`, `README.md`, and `tests/*`.
-- High-risk mapping focus: auth entry points, route/object authorization, tenant isolation, workflow idempotency, attachment ownership checks, migration completeness, logging of secrets, and test coverage credibility.
+- Prompt target: a FastAPI middle-platform API for identity, org-scoped RBAC, operations analytics/reporting, exports with desensitization and traceability, approval workflows, data governance/versioning, backup/archive/retry operations, and security/compliance controls.
+- Main implementation areas mapped: `app/api/v1/*` routes, `app/services/*`, `app/models/entities.py`, `app/middleware/auth.py`, `app/tasks/*`, `app/db/init_db.py`, and static tests in `tests/`.
+- Main outcome: the repository has a real multi-module backend skeleton with auth, RBAC, workflow engine pieces, exports, files, audit logs, and governance primitives, but it does **not** deliver several prompt-critical business flows end to end.
 
 ## 4. Section-by-section Review
 
-### 4.1 Hard Gates
-- 1.1 Documentation and static verifiability
-  - Conclusion: Fail
-  - Rationale: startup instructions exist, but the documented verification path is not statically reliable because auth-critical tables used by code are missing from Alembic revisions, and tests are not documented at all. The repo relies on `Base.metadata.create_all()` during init instead of migration completeness.
-  - Evidence: `README.md:20-28`, `README.md:47-49`, `app/db/init_db.py:8-15`, `app/models/entities.py:25-33`, `app/models/entities.py:314-319`, `alembic/versions/20260421_01_initial.py:12-154`, `alembic/versions/8aa4006e3ed0_domain_expansion_and_remediation.py:12-141`
-  - Manual verification note: manual migration replay is required because static evidence shows drift between models and revisions.
-- 1.2 Material deviation from Prompt
-  - Conclusion: Partial Pass
-  - Rationale: the project is centered on the stated domains, but several prompt-critical semantics are weakened: multi-organization membership is collapsed into a single `users.org_id`, idempotency is keyed by `idempotency_key` rather than business number, and reporting/governance coverage is partial.
-  - Evidence: `app/models/entities.py:53-71`, `app/services/auth_service.py:145-176`, `app/models/entities.py:91-105`, `app/services/process_service.py:123-137`, `app/api/v1/hospital.py:14-112`, `app/api/v1/metrics.py:14-78`
+### 1. Hard Gates
 
-### 4.2 Delivery Completeness
-- 2.1 Core requirement coverage
-  - Conclusion: Partial Pass
-  - Rationale: identity, RBAC, workflows, export jobs, audit logs, governance validation, lineage, rollback, metrics, and attachment upload/download exist; however, prompt-critical requirements are incomplete or incorrect for org joining semantics, business-number idempotency, complete workflow audit material linkage, and governance rollback breadth.
-  - Evidence: `app/api/router.py:5-14`, `app/api/v1/auth.py:13-56`, `app/api/v1/process.py:13-91`, `app/api/v1/export.py:17-94`, `app/api/v1/data_governance.py:13-59`, `app/services/process_service.py:115-183`, `app/services/data_governance_service.py:156-191`
-- 2.2 End-to-end deliverable vs partial/demo
-  - Conclusion: Partial Pass
-  - Rationale: the repo has a full service layout with docs, models, services, migrations, and tests, but several flows are still baseline-level or simulated, including password reset delivery by log output and simplified reporting/governance behavior.
-  - Evidence: `README.md:3`, `README.md:5-18`, `app/services/auth_service.py:106-126`, `app/api/v1/metrics.py:19-19`, `app/services/data_governance_service.py:34-45`
+#### 1.1 Documentation and static verifiability
+- Conclusion: **Partial Pass**
+- Rationale: README, env example, dependency manifests, and entry points exist, but the documented worker startup command is statically inconsistent with the repository and the tests are not reliable enough to prove major claims.
+- Evidence: `README.md:33-40`, `README.md:48-56`, `app/main.py:1-49`, `app/api/router.py:1-14`, `docker-compose.yml:25-37`
+- Manual verification note: startup, migrations, Celery, nginx, and backup scripts require runtime verification.
 
-### 4.3 Engineering and Architecture Quality
-- 3.1 Structure and module decomposition
-  - Conclusion: Pass
-  - Rationale: the repo is reasonably layered into `api`, `services`, `models`, `schemas`, `db`, `middleware`, and `tasks`, and is not piled into one file.
-  - Evidence: `README.md:5-18`, `app/api/router.py:5-14`
-- 3.2 Maintainability and extensibility
-  - Conclusion: Partial Pass
-  - Rationale: the overall structure is maintainable, but key architectural shortcuts reduce extensibility: tenant role is stored directly on `users`, org joining rewrites the active org on the user row, governance rollback is hard-coded to two entity types, and migrations show drift/manual breakage.
-  - Evidence: `app/models/entities.py:53-71`, `app/services/auth_service.py:165-174`, `app/services/data_governance_service.py:164-177`, `alembic/versions/8aa4006e3ed0_domain_expansion_and_remediation.py:144-220`
+#### 1.2 Material deviation from the Prompt
+- Conclusion: **Fail**
+- Rationale: the code is aligned with the prompt at the architecture level, but the delivered APIs materially under-cover the business service: core hospital/process records are not creatable through the API, and several required operational/search/reporting flows are only partially represented.
+- Evidence: `app/api/v1/hospital.py:14-162`, `app/api/v1/process.py:13-91`, `tests/test_audit_final_verification.py:58-64`, `tests/test_security_audit.py:81-96`
 
-### 4.4 Engineering Details and Professionalism
-- 4.1 Error handling, logging, validation, API design
-  - Conclusion: Partial Pass
-  - Rationale: input validation and HTTP errors are present, but a reporting endpoint contains a static coding error, password reset secrets are logged, and logging is minimal/unstructured for a compliance-oriented service.
-  - Evidence: `app/schemas/auth.py:10-23`, `app/services/process_service.py:186-201`, `app/api/v1/metrics.py:43-78`, `app/services/auth_service.py:120-123`, `app/core/logging.py:5-22`
-- 4.2 Real product/service vs demo shape
-  - Conclusion: Partial Pass
-  - Rationale: it resembles a real API service more than a toy example, but several core flows remain simplified enough that it does not meet acceptance as a production-grade delivery.
-  - Evidence: `README.md:5-18`, `app/tasks/jobs.py:112-167`, `app/services/auth_service.py:120-123`
+### 2. Delivery Completeness
 
-### 4.5 Prompt Understanding and Requirement Fit
-- 5.1 Business goal and constraint fit
-  - Conclusion: Partial Pass
-  - Rationale: the code clearly targets the prompt, but key semantics are misread or relaxed: duplicate-submission handling is not tied to business number, org-join behavior is not modeled as true multi-org membership, and some reporting/governance constraints are only partially represented.
-  - Evidence: `app/services/process_service.py:123-137`, `app/services/auth_service.py:145-176`, `app/models/entities.py:25-33`, `app/models/entities.py:53-58`, `app/api/v1/hospital.py:14-112`
+#### 2.1 Coverage of explicitly stated core requirements
+- Conclusion: **Fail**
+- Rationale: identity, org isolation, RBAC, exports, attachments, workflow engine primitives, and governance primitives exist; however, prompt-critical business APIs for creating/managing patients, doctors, appointments, expenses, resource applications, and credit changes are missing, and advanced multi-criteria reporting/search is only partially implemented.
+- Evidence: `app/api/v1/auth.py:16-115`, `app/api/v1/export.py:17-99`, `app/api/v1/files.py:16-60`, `app/api/v1/hospital.py:14-162`, `app/api/v1/metrics.py:15-122`
 
-### 4.6 Aesthetics
-- 6.1 Frontend/UI review
-  - Conclusion: Not Applicable
-  - Rationale: repository is backend/API-only.
-  - Evidence: `app/main.py:13-41`, `app/api/router.py:5-14`
+#### 2.2 End-to-end deliverable vs partial/example implementation
+- Conclusion: **Fail**
+- Rationale: the repository is more than a single-file demo, but core business entities are exercised in tests by inserting rows directly into the database instead of through public APIs, which is evidence of an incomplete end-to-end delivery.
+- Evidence: `tests/test_audit_final_verification.py:58-64`, `tests/test_security_audit.py:81-96`, `tests/test_export_integration.py:48-57`
+
+### 3. Engineering and Architecture Quality
+
+#### 3.1 Engineering structure and module decomposition
+- Conclusion: **Pass**
+- Rationale: the project has a reasonable module split across API, services, models, DB, core config/security, tasks, and migrations. Responsibilities are separated more like a service than a code sample.
+- Evidence: `app/api/router.py:1-14`, `app/services/auth_service.py:16-317`, `app/services/process_service.py:13-429`, `app/models/entities.py:17-420`
+
+#### 3.2 Maintainability and extensibility
+- Conclusion: **Partial Pass**
+- Rationale: the code is modular and extendable, but delivery drift is visible in inconsistent documentation/test expectations, duplicated Celery task decoration, and business coverage gaps that force tests to bypass public interfaces.
+- Evidence: `README.md:40`, `app/tasks/jobs.py:59-75`, `tests/test_audit_remediation_v2.py:96-103`, `tests/test_remediation_verification.py:14-23`
+
+### 4. Engineering Details and Professionalism
+
+#### 4.1 Error handling, logging, validation, API design
+- Conclusion: **Partial Pass**
+- Rationale: there is meaningful validation for passwords, HTTPS enforcement, file size/type, lockout, org scoping, and some object checks; audit logging is present; however, some APIs silently downgrade invalid input (`format` falls back to CSV), and required workflow-attachment ownership validation is incomplete for prompt-mandated workflow types.
+- Evidence: `app/schemas/auth.py:10-47`, `app/main.py:20-43`, `app/services/auth_service.py:111-150`, `app/services/storage_service.py:23-72`, `app/api/v1/export.py:24-25`
+
+#### 4.2 Real product/service shape vs demo
+- Conclusion: **Partial Pass**
+- Rationale: the overall structure resembles a service, but missing business-creation endpoints and reliance on direct DB seeding in tests prevent it from qualifying as a complete product-style deliverable for the prompt.
+- Evidence: `app/api/v1/hospital.py:14-162`, `tests/test_audit_final_verification.py:58-64`
+
+### 5. Prompt Understanding and Requirement Fit
+
+#### 5.1 Business-goal and constraint fit
+- Conclusion: **Fail**
+- Rationale: the code understands the intended domains, but key requirement semantics are weakened: advanced reporting/filtering is simplified, prompt-required workflow material uploads are not fully supported for both workflow types, and the attendance anomaly metric semantics documented in README do not match the implementation.
+- Evidence: `README.md:42-46`, `app/api/v1/metrics.py:52-85`, `app/services/storage_service.py:26-42`, `app/db/init_db.py:77-121`
+
+### 6. Aesthetics
+
+#### 6.1 Frontend visual/interaction quality
+- Conclusion: **Not Applicable**
+- Rationale: this repository is backend-only FastAPI service code with no frontend implementation in scope.
+- Evidence: `app/main.py:1-49`, `app/api/router.py:1-14`
 
 ## 5. Issues / Suggestions (Severity-Rated)
 
-- Severity: Blocker
-  - Title: Alembic delivery is incomplete for auth-critical tables
-  - Conclusion: Fail
-  - Evidence: `app/models/entities.py:25-33`, `app/models/entities.py:314-319`, `app/services/auth_service.py:145-176`, `app/services/auth_service.py:179-192`, `alembic/versions/20260421_01_initial.py:12-154`, `alembic/versions/8aa4006e3ed0_domain_expansion_and_remediation.py:12-141`
-  - Impact: documented migration/setup is not statically sufficient to provision tables used by org membership and token revocation; acceptance verification can fail before core auth flows are usable.
-  - Minimum actionable fix: add proper Alembic revisions for `organization_memberships` and `token_blacklist`, then align docs to use migrations consistently instead of relying on `create_all`.
+### Blocker
 
-- Severity: High
-  - Title: Multi-organization architecture is modeled as a single mutable tenant on `users`
-  - Conclusion: Fail
-  - Evidence: `app/models/entities.py:53-71`, `app/models/entities.py:25-33`, `app/services/auth_service.py:145-176`
-  - Impact: joining another organization rewrites `users.org_id` and `users.role_id`, collapsing membership history and making roles tenant-global instead of org-scoped; this is a poor fit for “create/join organizations” with isolated org data.
-  - Minimum actionable fix: introduce tenant-scoped membership/role assignment as the source of truth and stop mutating the user’s global org/role on join.
+#### 1. Core business APIs are incomplete, so the service is not an end-to-end deliverable
+- Severity: **Blocker**
+- Conclusion: **Fail**
+- Evidence: `app/api/v1/hospital.py:14-162`, `app/api/v1/process.py:13-91`, `tests/test_audit_final_verification.py:58-64`, `tests/test_security_audit.py:81-96`
+- Impact: Patients, doctors, appointments, expenses, resource applications, and credit changes cannot be created or managed through public APIs. Tests compensate by writing DB rows directly, which means the delivered service cannot cover the prompt’s business flows from API entry to workflow/audit/export.
+- Minimum actionable fix: add authenticated create/update/read APIs for the hospital/process business entities and route workflow initiation from those APIs instead of relying on direct DB setup.
 
-- Severity: High
-  - Title: Workflow idempotency does not enforce the prompt’s business-number rule
-  - Conclusion: Fail
-  - Evidence: `app/models/entities.py:91-105`, `app/services/process_service.py:123-137`
-  - Impact: duplicate submissions with the same business number but different idempotency keys can create multiple instances within 24 hours, violating a stated hard constraint.
-  - Minimum actionable fix: enforce 24-hour idempotency on `(org_id, business_id)` at service level, and preferably add a supporting DB constraint/index strategy.
+### High
 
-- Severity: High
-  - Title: Password reset tokens are written to logs in clear text
-  - Conclusion: Fail
-  - Evidence: `app/services/auth_service.py:120-123`, `app/core/logging.py:10-20`
-  - Impact: reset tokens become recoverable from logs, which is a direct secret-leak path in a security/compliance domain.
-  - Minimum actionable fix: remove token logging entirely and replace it with a non-secret audit event or out-of-band delivery stub.
+#### 2. Attachment ownership validation does not support the two prompt-required workflow business IDs
+- Severity: **High**
+- Conclusion: **Fail**
+- Evidence: `app/services/storage_service.py:26-42`, `app/models/entities.py:383-412`
+- Impact: uploaded application materials cannot be linked via `business_owner_id` for `ResourceApplication` (`RES-*`) or `CreditChange` (`CRD-*`), even though the prompt requires application materials and full-chain audit support for those workflow types.
+- Minimum actionable fix: extend `save_attachment()` business-owner validation to recognize and authorize `RES-*` and `CRD-*` entities, with org and ownership checks matching the prompt’s workflow domain.
 
-- Severity: High
-  - Title: Advanced metrics endpoint has a static code error
-  - Conclusion: Fail
-  - Evidence: `app/api/v1/metrics.py:1-3`, `app/api/v1/metrics.py:43-78`
-  - Impact: `timedelta` is used but never imported, so the advanced reporting path is statically broken.
-  - Minimum actionable fix: import `timedelta` and add route-level test coverage for the endpoint.
+#### 3. Operations analytics/search coverage is materially partial versus the prompt
+- Severity: **High**
+- Conclusion: **Fail**
+- Evidence: `app/api/v1/hospital.py:14-162`, `app/api/v1/metrics.py:23-122`, `app/schemas/metrics.py:5-9`
+- Impact: the prompt calls for customizable reporting and advanced multi-criteria searches across appointments/patients/doctors/expenses, but the delivered APIs provide only limited filters and snapshot aggregation; `group_by` is unused and there is no cross-domain advanced filtering endpoint.
+- Minimum actionable fix: implement the missing search/reporting dimensions explicitly required by the prompt, including richer query models, pagination/filter semantics, and report generation tied to the hospital entities rather than only metric snapshots.
 
-- Severity: High
-  - Title: Production secret guard does not block the actual insecure defaults
-  - Conclusion: Fail
-  - Evidence: `app/main.py:7-11`, `app/core/config.py:7-18`, `.env.example:1-11`
-  - Impact: production can start with placeholder JWT/encryption secrets because the startup check only blocks two exact strings and misses the configured defaults.
-  - Minimum actionable fix: validate all secret placeholders robustly and refuse startup when `SECRET_KEY`/`AES_KEY` are default or weak.
+#### 4. Test suite does not provide trustworthy assurance for several critical claims
+- Severity: **High**
+- Conclusion: **Fail**
+- Evidence: `tests/conftest.py:15-24`, `tests/test_export_integration.py:98-116`, `app/tasks/jobs.py:226-239`, `tests/test_audit_remediation_v2.py:96-103`, `app/api/v1/metrics.py:77-85`, `tests/test_remediation_verification.py:14-23`, `app/services/auth_service.py:51-54`
+- Impact: several tests are statically inconsistent with the code they claim to verify, and the suite runs on SQLite rather than the target PostgreSQL stack. Severe defects could remain undetected even if the test suite passes.
+- Minimum actionable fix: align tests with actual response contracts and field names, add API-level tests for missing business flows/security edges, and add Postgres-targeted verification for constraints/indexing/migration behavior.
 
-- Severity: High
-  - Title: Appointment attachment authorization compares patient/doctor entity IDs to user IDs
-  - Conclusion: Fail
-  - Evidence: `app/services/storage_service.py:151-155`, `app/models/entities.py:282-295`, `app/models/entities.py:53-71`
-  - Impact: object-level authorization for appointment attachments is unsound; it can deny legitimate access and may accidentally grant access when unrelated table IDs collide numerically.
-  - Minimum actionable fix: map appointment ownership through real user-linked identities or explicit ACL records instead of comparing unrelated primary keys.
+### Medium
 
-- Severity: Medium
-  - Title: Migration set shows downgrade and drift defects
-  - Conclusion: Partial Fail
-  - Evidence: `alembic/versions/8aa4006e3ed0_domain_expansion_and_remediation.py:144-220`
-  - Impact: downgrade references `audit_log_signatures` and `postgresql` objects that are not defined in the file, which weakens migration professionalism and recoverability.
-  - Minimum actionable fix: repair autogenerated drift, import required dialect modules, and validate upgrade/downgrade chains statically.
+#### 5. README startup instructions are statically inconsistent with the repository
+- Severity: **Medium**
+- Conclusion: **Fail**
+- Evidence: `README.md:33-40`, `docker-compose.yml:25-37`, `app/tasks/celery_app.py:1-40`
+- Impact: the documented worker command points to `app.tasks.worker`, which does not exist; a reviewer cannot follow the runbook without correcting it first.
+- Minimum actionable fix: update README to the actual Celery app path and document the real worker/beat commands consistently with `docker-compose.yml`.
 
-- Severity: Medium
-  - Title: Governance rollback/versioning is hard-coded to only two entity types
-  - Conclusion: Partial Fail
-  - Evidence: `app/services/data_governance_service.py:156-191`
-  - Impact: prompt-level versioning/rollback/lineage support is only partially implemented and does not generalize across the platform’s main data domains.
-  - Minimum actionable fix: define a broader rollback strategy or narrow/document the supported entities explicitly.
+#### 6. Documented metric semantics do not match implemented logic
+- Severity: **Medium**
+- Conclusion: **Partial Fail**
+- Evidence: `README.md:42-46`, `app/api/v1/metrics.py:65-70`, `app/tasks/jobs.py:124-129`
+- Impact: README defines attendance anomalies as overdue pending tasks per active user, while the code computes cancelled appointments ratio. This undermines business traceability for a prompt-critical KPI area.
+- Minimum actionable fix: either change the implementation to the documented semantics or update the documentation and acceptance mapping to the actual intended metric definition.
 
-- Severity: Medium
-  - Title: Test suite is materially misaligned with actual routes and runtime assumptions
-  - Conclusion: Partial Fail
-  - Evidence: `app/api/router.py:11-12`, `tests/test_audit_remediation.py:96-106`, `tests/test_audit_remediation_v2.py:114-121`, `tests/test_export_integration.py:12-20`
-  - Impact: tests reference nonexistent paths such as `/api/health` and `/api/governance/...`, and use the live configured DB session directly, so they are weak evidence for acceptance.
-  - Minimum actionable fix: align route paths with actual router prefixes, isolate test DB/session setup, and document the test entry command.
+#### 7. Documentation claims about multi-tenant identity conflict with the middleware implementation
+- Severity: **Medium**
+- Conclusion: **Partial Fail**
+- Evidence: `README.md:58-61`, `app/middleware/auth.py:47-52`
+- Impact: README states org/role context is resolved “without mutating the base record,” but middleware explicitly mutates `user.org_id` and `user.role_id` in memory. This makes the security model harder to reason about and weakens static verifiability.
+- Minimum actionable fix: either stop mutating the loaded entity and carry effective membership context separately, or correct the documentation and audit notes.
+
+### Low
+
+#### 8. Job task definition contains duplicated Celery decoration
+- Severity: **Low**
+- Conclusion: **Partial Fail**
+- Evidence: `app/tasks/jobs.py:59-75`
+- Impact: duplicated `@celery_app.task` decoration on `aggregate_daily_metrics` is a maintainability smell and can confuse task registration intent.
+- Minimum actionable fix: keep a single decorator per task and retain one authoritative task name/config block.
 
 ## 6. Security Review Summary
-- Authentication entry points: Partial Pass. Login/logout/register/reset endpoints exist and use JWT plus password hashing, but reset tokens are logged and token-blacklist persistence is not covered by migrations. Evidence: `app/api/v1/auth.py:13-56`, `app/services/auth_service.py:64-126`, `app/models/entities.py:314-319`.
-- Route-level authorization: Partial Pass. Most domain routers use `require_permission`, but `/api/users/me` is only authenticated, not permission-gated; that is acceptable for self-profile, though overall permission coverage depends on seeded RBAC. Evidence: `app/api/v1/process.py:13-91`, `app/api/v1/export.py:17-94`, `app/api/v1/files.py:16-59`, `app/api/v1/users.py:10-22`, `app/middleware/auth.py:36-49`.
-- Object-level authorization: Fail. Task completion checks assignee ownership correctly, but appointment attachment ownership compares `Appointment.patient_id`/`doctor_id` to `User.id`, which is not a sound object authorization model. Evidence: `app/services/process_service.py:186-193`, `app/services/storage_service.py:143-163`, `app/models/entities.py:290-291`.
-- Function-level authorization: Partial Pass. Service-level checks exist for task completion and attachment reads, but org-join and role mutation are functionally over-simplified and not tenant-scoped. Evidence: `app/services/process_service.py:186-201`, `app/services/auth_service.py:145-176`.
-- Tenant / user isolation: Partial Pass. Most queries scope by `actor.org_id`, but the user model itself is single-tenant and `join_organization` rewrites the active tenant, which is not a robust multi-org design. Evidence: `app/middleware/auth.py:29-33`, `app/api/v1/hospital.py:26`, `app/services/auth_service.py:171-174`.
-- Admin / internal / debug protection: Pass. No obvious debug/admin backdoors or unprotected internal routes were found; audit/export/files/process routes are permission-protected. Evidence: `app/api/router.py:5-14`, `app/api/v1/audit.py:12-15`, `app/api/v1/export.py:17-94`.
+
+### Authentication entry points
+- Conclusion: **Partial Pass**
+- Evidence: `app/api/v1/auth.py:16-115`, `app/services/auth_service.py:111-189`, `app/schemas/auth.py:10-47`
+- Reasoning: register/login/logout/password reset exist; password policy and lockout logic are implemented. Manual verification is still required for actual password-reset delivery and live token invalidation behavior.
+
+### Route-level authorization
+- Conclusion: **Partial Pass**
+- Evidence: `app/middleware/auth.py:56-69`, `app/api/v1/process.py:13-91`, `app/api/v1/export.py:17-99`, `app/api/v1/data_governance.py:13-61`
+- Reasoning: most non-auth routes are protected with `require_permission`. The main gap is not missing guards, but incomplete business surface area and uneven test assurance.
+
+### Object-level authorization
+- Conclusion: **Partial Pass**
+- Evidence: `app/services/process_service.py:284-291`, `app/services/storage_service.py:148-215`, `app/api/v1/export.py:54-86`
+- Reasoning: task completion, export download, and attachment reads check org/object ownership. Coverage is weaker for hospital search endpoints, which are org-scoped list APIs rather than object-scoped operations.
+
+### Function-level authorization
+- Conclusion: **Partial Pass**
+- Evidence: `app/middleware/auth.py:56-69`, `app/db/init_db.py:22-50`
+- Reasoning: authorization is resource/action based and seeded by role. Static review did not find unprotected admin write endpoints in the reviewed API set, but test coverage is insufficient to prove the matrix thoroughly.
+
+### Tenant / user data isolation
+- Conclusion: **Partial Pass**
+- Evidence: `app/middleware/auth.py:34-45`, `app/api/v1/hospital.py:26`, `app/api/v1/export.py:54`, `app/services/storage_service.py:149`, `tests/test_security_audit.py:6-41`
+- Reasoning: org filters are used consistently in the reviewed domains, and membership checks exist. Manual verification is still required for live PostgreSQL behavior and multi-org edge cases.
+
+### Admin / internal / debug protection
+- Conclusion: **Pass**
+- Evidence: `app/api/router.py:1-14`, `app/api/v1/audit.py:12-15`, `app/api/v1/process.py:13-47`, `app/api/v1/export.py:17-99`
+- Reasoning: no obvious debug/internal admin bypass routes were found in the registered API surface. The public `/health` endpoint is expected and low risk.
 
 ## 7. Tests and Logging Review
-- Unit tests: Partial Pass. Small unit tests exist for password validation, process branch resolution, and export masking, but they cover helpers rather than core risk areas. Evidence: `tests/test_password_validation.py:6-8`, `tests/test_process_routing.py:4-20`, `tests/test_export_service.py:4-25`.
-- API / integration tests: Partial Pass. Some API-style tests exist, but they are route-drifted and DB-coupled, which reduces their evidentiary value. Evidence: `tests/test_audit_remediation.py:67-124`, `tests/test_audit_remediation_v2.py:51-121`, `tests/test_export_integration.py:55-135`.
-- Logging categories / observability: Partial Pass. There is a basic logger and many audit events, but application logging is thin and not structured enough for a compliance-heavy platform. Evidence: `app/core/logging.py:5-22`, `app/services/audit_service.py:1-5`, `app/tasks/jobs.py:89-107`.
-- Sensitive-data leakage risk in logs / responses: Fail. Password reset tokens are logged in clear text, and export completion audit logs store internal output paths. Evidence: `app/services/auth_service.py:120-123`, `app/tasks/jobs.py:144-150`.
+
+### Unit tests
+- Conclusion: **Partial Pass**
+- Evidence: `tests/test_process_routing.py:1-21`, `tests/test_export_service.py:1-27`, `tests/test_password_validation.py:1-8`
+- Reasoning: there are small unit tests for routing helpers, export masking, and password validation, but they cover only narrow helper behavior.
+
+### API / integration tests
+- Conclusion: **Partial Pass**
+- Evidence: `tests/test_security_audit.py:6-119`, `tests/test_export_integration.py:45-116`, `tests/test_audit_final_verification.py:37-130`
+- Reasoning: API/integration-style tests exist, but many rely on direct DB setup, and several assertions are out of sync with the implementation.
+
+### Logging categories / observability
+- Conclusion: **Partial Pass**
+- Evidence: `app/core/logging.py:5-22`, `app/services/audit_service.py:6-7`, `app/tasks/jobs.py:216-237`, `app/services/auth_service.py:164-170`
+- Reasoning: audit/event logging is present and categorized, but there is minimal structured operational logging beyond audit inserts.
+
+### Sensitive-data leakage risk in logs / responses
+- Conclusion: **Partial Pass**
+- Evidence: `app/services/auth_service.py:167-170`, `app/tasks/jobs.py:230-236`, `app/core/security.py:89-118`
+- Reasoning: the code attempts to avoid logging reset tokens and raw export errors, and response desensitization exists. Static review did not find blatant logging of encrypted IDs/contact fields, but some audit metadata still includes usernames and other business context.
 
 ## 8. Test Coverage Assessment (Static Audit)
 
 ### 8.1 Test Overview
-- Unit and API/integration-style tests exist under `tests/`.
-- Test framework appears to be `pytest` with FastAPI `TestClient`.
-- Test entry points are the individual `tests/test_*.py` files.
-- Documentation does not provide a test command.
-- Evidence: `tests/test_health.py:1-9`, `tests/test_audit_remediation.py:1-124`, `README.md:20-57`
+- Unit tests exist: helper/masking/password validation tests under `tests/test_process_routing.py`, `tests/test_export_service.py`, and `tests/test_password_validation.py`.
+- API / integration tests exist: `tests/test_security_audit.py`, `tests/test_export_integration.py`, `tests/test_audit_*`, `tests/test_remediation_verification.py`.
+- Test framework: `pytest` with FastAPI `TestClient`.
+- Test entry points: repository documents `pytest`. Evidence: `README.md:48-56`, `pyproject.toml:22-27`.
+- Important boundary: tests use SQLite via `sqlite:///...` fixture rather than PostgreSQL. Evidence: `tests/conftest.py:15-24`.
 
 ### 8.2 Coverage Mapping Table
 
 | Requirement / Risk Point | Mapped Test Case(s) | Key Assertion / Fixture / Mock | Coverage Assessment | Gap | Minimum Test Addition |
 |---|---|---|---|---|---|
-| Password complexity | `tests/test_password_validation.py:6-8` | invalid password raises `ValueError` | basically covered | no positive-case API coverage | add register/reset endpoint tests for valid and invalid passwords |
-| Auth logout revocation | `tests/test_audit_remediation.py:67-83` | post-logout token rejected | basically covered | depends on live DB and missing migrated blacklist table | add isolated DB-backed auth tests with migration-complete schema |
-| HTTPS enforcement | `tests/test_audit_remediation.py:96-106` | expects 403 in acceptance env | basically covered | targets `/api/health`, which does not exist | add test against an existing API route and root `/health` boundary |
-| Org join authorization | `tests/test_audit_remediation.py:108-124` | join without membership returns 403 | basically covered | does not test multi-org role/isolation semantics | add tests for membership-scoped role behavior and non-destructive org switching |
-| Export field whitelisting/desensitization | `tests/test_export_service.py:16-25` | strips email for non-admin and masks | sufficient for helper logic | no endpoint-level authorization coverage | add `/api/export/jobs` tests for admin/non-admin behavior |
-| Export job lifecycle | `tests/test_export_integration.py:55-135` | completed/failed status and audit log | basically covered | uses configured DB directly; no tenant isolation assertions | add isolated worker/task tests per org and unauthorized download cases |
-| Workflow branch routing | `tests/test_process_routing.py:4-20` | branch conditions resolve next nodes | basically covered | no end-to-end instance/task/idempotency tests | add start/complete process tests including duplicate submission by business number |
-| Metrics advanced report | `tests/test_audit_remediation_v2.py:89-96` | expects 200 and response keys | insufficient | route currently has static `timedelta` bug | fix route and add isolated API test that would catch import/runtime errors |
-| Data governance lineage RBAC | `tests/test_audit_remediation_v2.py:114-121` | expects 200 on `/api/governance/...` | missing | route path is wrong; no meaningful coverage of actual endpoint | add tests for `/api/data-governance/lineage/...` with allowed and forbidden roles |
-| Attachment object authorization | none found | none | missing | high-risk access checks are untested | add upload/download tests for same-org authorized, cross-user unauthorized, and appointment/expense/process ownership |
-| Tenant isolation across hospital/process/export/audit | none found | none | missing | severe defects could remain undetected | add cross-org fixtures and explicit 403/404 isolation assertions |
+| Password complexity | `tests/test_password_validation.py:6-8` | `RegisterRequest(...)` raises on non-alnum password | basically covered | No positive-path API test for register/login password flow | Add register/login API tests for valid and invalid passwords |
+| Login lockout after 5 failures in 10 min | None found | No test | missing | Prompt-critical security control untested | Add API/service tests for failure counter, 10-minute window reset, and 30-minute lockout |
+| Logout invalidates token | `tests/test_audit_remediation.py:58-74` | Access protected route before/after logout | basically covered | Assertion text is inconsistent with code detail wording | Align exact assertions and keep revocation-path test |
+| HTTPS-only transport | `tests/test_audit_final_verification.py:155-166`, `tests/test_remediation_verification.py:67-72` | `403` expected for plain HTTP | basically covered | Tests themselves are inconsistent elsewhere on detail strings | Add one canonical middleware test for both forwarded HTTPS and plain HTTP |
+| Org membership / tenant isolation | `tests/test_security_audit.py:6-41`, `tests/test_remediation_verification.py:25-66` | Org-scoped list output; switched token org context | basically covered | Not all domains covered; SQLite only | Add export/files/process isolation tests under PostgreSQL target |
+| Route authorization (RBAC) | `tests/test_security_audit.py:43-68` | Auditor can read audit logs but cannot create process definition | insufficient | Only one role/path combination covered | Add matrix tests for all four roles and major resources/actions |
+| Object-level auth for task completion | `tests/test_security_audit.py:101-118` | Same assignee completes task | insufficient | No explicit negative test for non-assignee `403` | Add non-assignee and completed-task conflict tests |
+| Attachment access control | `tests/test_remediation_verification.py:128-180` | uploader allowed, same-org non-owner denied, other org hidden | basically covered | No coverage for `business_owner_id` links or admin/auditor oversight cases | Add workflow-linked attachment access tests |
+| 24-hour idempotency on workflow submission | `tests/test_audit_final_fixes.py:76-108`, `tests/test_remediation_verification.py:74-121` | same request returns same instance; >24h yields new one | basically covered | No concurrency / race test; no DB-level guarantee | Add concurrent duplicate-submission test against PostgreSQL |
+| Export lifecycle and traceability | `tests/test_export_integration.py:45-80` | completed job writes file and audit log | basically covered | Failure-path test expectation conflicts with redacted code | Fix failure test and add API-level create/download authorization tests |
+| Advanced reporting/search | `tests/test_audit_final_fixes.py:132-138`, `tests/test_audit_remediation_v2.py:96-103` | status `200` only | insufficient | Tests do not verify prompt-required filters or output semantics; one expects nonexistent `sla_compliance_rate` field | Add assertion-rich tests for report schema and filtering behavior |
+| Resource application / credit change end-to-end APIs | None at API level | Tests seed DB records directly | missing | Major business flows bypass public interfaces entirely | Add API submission/update/query tests once those endpoints exist |
+| Backup/archive/retry operational controls | `tests/test_remediation_verification.py:123-126` | only `max_retries == 3` | insufficient | No backup/restore/pruning behavior test coverage | Add task unit tests for backup script invocation and retention pruning logic |
 
 ### 8.3 Security Coverage Audit
-- Authentication: basically covered, but only partially trustworthy because tests use the live configured DB session and do not validate migration completeness. Evidence: `tests/test_audit_remediation.py:67-94`.
-- Route authorization: insufficient. There is little direct coverage of 401/403 behavior across domain routers. Evidence: no targeted tests for process/export/files/audit RBAC paths beyond a few happy-path cases.
-- Object-level authorization: missing. No meaningful tests cover attachment ownership checks, task ownership edge cases, or cross-tenant object access.
-- Tenant / data isolation: missing. No cross-org tests were found for hospital, export, audit, or process reads.
-- Admin / internal protection: missing. No targeted tests assert denial for lower-privilege roles on admin-capable actions.
+- Authentication: **insufficient**. Password policy and logout have some coverage, but lockout, reset-token lifecycle, and live membership-role edge cases remain largely untested.
+- Route authorization: **insufficient**. Only a narrow auditor/process check exists; severe RBAC defects across other resources could still pass.
+- Object-level authorization: **basically covered** for attachments and partially for tasks, but negative cases are sparse.
+- Tenant / data isolation: **basically covered** for some hospital/file/process flows, but not exhaustively across exports/governance, and not on the target PostgreSQL stack.
+- Admin / internal protection: **insufficient**. No dedicated coverage matrix proves that privileged/internal paths are consistently guarded.
 
 ### 8.4 Final Coverage Judgment
-- Fail
-- Major risks are only lightly covered: password validation, helper-level export masking, simple route smoke tests, and a logout revocation path.
-- Uncovered or weakly covered risks include tenant isolation, business-number idempotency, attachment object authorization, route-level RBAC denial cases, governance route correctness, and the advanced metrics path. The current tests could pass while severe security and acceptance defects remain.
+- **Fail**
+- Major risks covered: some tenant isolation, idempotency behavior, logout revocation, attachment access, and export lifecycle.
+- Major uncovered risks: lockout policy, full RBAC matrix, missing business APIs, advanced reporting semantics, PostgreSQL-specific behavior, backup/archive operations, and prompt-required workflow-material paths. The current tests could pass while severe delivery and security defects remain.
 
 ## 9. Final Notes
-- The repository is clearly aimed at the prompt and has a credible service skeleton, but the acceptance blockers are structural rather than cosmetic.
-- The most important remediation order is: migration completeness, tenant membership/role model, business-number idempotency, secret-handling in logs, and test realignment to actual routes and isolated DB setup.
+- This is a static-only conclusion set. Runtime success, Docker behavior, nginx/TLS behavior, Celery execution, and PostgreSQL migration correctness were not executed and remain manual-verification items.
+- The repository is architecturally credible as a backend skeleton, but it does not meet delivery acceptance for the prompt because core business flows are still partial and the static assurance layer is not strong enough to close that gap.

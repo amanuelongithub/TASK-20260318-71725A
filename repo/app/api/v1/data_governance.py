@@ -17,6 +17,8 @@ def create_version(
     actor: User = Depends(require_permission("data_governance", "write")),
 ) -> dict:
     row = data_governance_service.create_data_version(db, actor, payload.entity_type, payload.entity_id, payload.payload)
+    db.commit()
+    db.refresh(row)
     return {"version_id": row.id, "version_no": row.version_no}
 
 

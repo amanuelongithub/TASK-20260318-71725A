@@ -29,7 +29,7 @@ def upgrade() -> None:
     sa.ForeignKeyConstraint(['org_id'], ['organizations.id'], ),
     sa.PrimaryKeyConstraint('id')
     )
-    op.create_index(op.f('ix_doctors_license_number'), 'doctors', ['license_number'], unique=True)
+    op.create_index('uq_org_license_num', 'doctors', ['org_id', 'license_number'], unique=True)
     op.create_index(op.f('ix_doctors_org_id'), 'doctors', ['org_id'], unique=False)
     op.create_table('patients',
     sa.Column('id', sa.Integer(), nullable=False),
@@ -43,7 +43,7 @@ def upgrade() -> None:
     sa.PrimaryKeyConstraint('id')
     )
     op.create_index(op.f('ix_patients_org_id'), 'patients', ['org_id'], unique=False)
-    op.create_index(op.f('ix_patients_patient_number'), 'patients', ['patient_number'], unique=True)
+    op.create_index('uq_org_patient_num', 'patients', ['org_id', 'patient_number'], unique=True)
     op.create_table('appointments',
     sa.Column('id', sa.Integer(), nullable=False),
     sa.Column('org_id', sa.Integer(), nullable=False),
@@ -59,7 +59,7 @@ def upgrade() -> None:
     sa.ForeignKeyConstraint(['patient_id'], ['patients.id'], ),
     sa.PrimaryKeyConstraint('id')
     )
-    op.create_index(op.f('ix_appointments_appointment_number'), 'appointments', ['appointment_number'], unique=True)
+    op.create_index('uq_org_appointment_num', 'appointments', ['org_id', 'appointment_number'], unique=True)
     op.create_index(op.f('ix_appointments_org_id'), 'appointments', ['org_id'], unique=False)
     op.create_table('expenses',
     sa.Column('id', sa.Integer(), nullable=False),
@@ -75,7 +75,7 @@ def upgrade() -> None:
     sa.ForeignKeyConstraint(['submitted_by'], ['users.id'], ),
     sa.PrimaryKeyConstraint('id')
     )
-    op.create_index(op.f('ix_expenses_expense_number'), 'expenses', ['expense_number'], unique=True)
+    op.create_index('uq_org_expense_num', 'expenses', ['org_id', 'expense_number'], unique=True)
     op.create_index(op.f('ix_expenses_org_id'), 'expenses', ['org_id'], unique=False)
     op.create_table('import_batch_details',
     sa.Column('id', sa.Integer(), nullable=False),
@@ -215,9 +215,11 @@ def downgrade() -> None:
     op.drop_index(op.f('ix_patients_patient_number'), table_name='patients')
     op.drop_index(op.f('ix_patients_org_id'), table_name='patients')
     op.drop_table('patients')
-    op.drop_index(op.f('ix_doctors_org_id'), table_name='doctors')
-    op.drop_index(op.f('ix_doctors_license_number'), table_name='doctors')
     op.drop_table('doctors')
+    op.drop_index('uq_org_license_num', table_name='doctors')
+    op.drop_index('uq_org_patient_num', table_name='patients')
+    op.drop_index('uq_org_appointment_num', table_name='appointments')
+    op.drop_index('uq_org_expense_num', table_name='expenses')
     # op.drop_index(op.f('ix_audit_log_signatures_org_id'), table_name='audit_log_signatures')
     # op.drop_table('audit_log_signatures')
     # ### end Alembic commands ###

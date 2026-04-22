@@ -25,7 +25,7 @@ def create_data_version(db: Session, actor: User, entity_type: str, entity_id: s
     )
     db.add(version)
     log_event(db, actor.org_id, actor.id, "governance.version_created", {"entity_type": entity_type, "entity_id": entity_id, "version_no": version.version_no})
-    db.commit()
+    db.flush()
     db.refresh(version)
     return version
 
@@ -165,15 +165,39 @@ def rollback_to_version(db: Session, actor: User, version_id: int) -> dict:
         from app.models.entities import Expense
         entity = db.scalar(select(Expense).where(Expense.expense_number == version.entity_id, Expense.org_id == actor.org_id))
         if entity:
-            if "status" in payload: entity.status = payload["status"]
-            if "amount" in payload: entity.amount = float(payload["amount"])
+            for field in ["amount", "category", "status", "notes"]:
+                if field in payload:
+                    setattr(entity, field, payload[field])
             restored = True
     elif version.entity_type == "appointment":
         from app.models.entities import Appointment
         entity = db.scalar(select(Appointment).where(Appointment.appointment_number == version.entity_id, Appointment.org_id == actor.org_id))
         if entity:
-            if "status" in payload: entity.status = payload["status"]
-            if "notes" in payload: entity.notes = payload["notes"]
+            for field in ["status", "scheduled_time", "notes"]:
+                if field in payload:
+                    val = payload[field]
+                    if field == "scheduled_time" and val:
+                        val = datetime.fromisoformat(val)
+                    setattr(entity, field, val)
+            restored = True
+    elif version.entity_type == "patient":
+        from app.models.entities import Patient
+        entity = db.scalar(select(Patient).where(Patient.id == int(version.entity_id), Patient.org_id == actor.org_id))
+        if entity:
+            for field in ["full_name", "dob"]:
+                if field in payload:
+                    val = payload[field]
+                    if field == "dob" and val:
+                        val = datetime.fromisoformat(val)
+                    setattr(entity, field, val)
+            restored = True
+    elif version.entity_type == "doctor":
+        from app.models.entities import Doctor
+        entity = db.scalar(select(Doctor).where(Doctor.id == int(version.entity_id), Doctor.org_id == actor.org_id))
+        if entity:
+            for field in ["full_name", "specialty", "is_active"]:
+                if field in payload:
+                    setattr(entity, field, payload[field])
             restored = True
 
     if restored:

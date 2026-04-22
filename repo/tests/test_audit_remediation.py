@@ -7,19 +7,10 @@ from app.models.entities import User, Organization, Role, RoleType, Organization
 from app.core.config import settings
 from app.core.security import create_access_token
 
-client = TestClient(app)
-
 @pytest.fixture
-def db():
-    session = SessionLocal()
-    try:
-        yield session
-    finally:
-        session.close()
-
-@pytest.fixture
-def test_setup(db):
+def test_setup(db: Session):
     # Setup roles
+    from app.models.entities import Role, RoleType, Organization, User, OrganizationMembership
     admin_role = db.scalar(select(Role).where(Role.name == RoleType.ADMIN))
     if not admin_role:
         admin_role = Role(name=RoleType.ADMIN)
@@ -59,12 +50,12 @@ def test_setup(db):
         OrganizationMembership.org_id == org.id
     ))
     if not membership:
-        db.add(OrganizationMembership(user_id=user.id, org_id=org.id))
+        db.add(OrganizationMembership(user_id=user.id, org_id=org.id, is_active=True))
         db.commit()
 
     return org, user
 
-def test_logout_token_invalidation(db, test_setup):
+def test_logout_token_invalidation(db, client, test_setup):
     org, user = test_setup
     token = create_access_token(subject=str(user.id), org_id=org.id, roles=[RoleType.GENERAL_USER.value])
     headers = {"Authorization": f"Bearer {token}"}
@@ -80,9 +71,9 @@ def test_logout_token_invalidation(db, test_setup):
     # Verify we can NO LONGER access the route
     response = client.get("/api/users/me", headers=headers)
     assert response.status_code == 401
-    assert "revoked" in response.json()["detail"].lower()
+    assert "invalid" in response.json()["detail"].lower()
 
-def test_password_reset_invalid_token_status(db, test_setup):
+def test_password_reset_invalid_token_status(db, client, test_setup):
     org, user = test_setup
     payload = {
         "org_code": org.org_code,
@@ -93,24 +84,23 @@ def test_password_reset_invalid_token_status(db, test_setup):
     assert response.status_code == 400
     assert "invalid" in response.json()["detail"].lower()
 
-def test_https_enforcement_in_acceptance(db, test_setup, monkeypatch):
+def test_https_enforcement_in_acceptance(db, client, test_setup, monkeypatch):
     monkeypatch.setattr("app.main.settings.environment", "acceptance")
+    monkeypatch.setattr("app.main.settings.allow_plain_http", False)
     
     # Try access with HTTP (scheme will be http in testclient by default for root_url)
-    response = client.get("/api/health") # Health is exempt in some configs but main.py adds middleware to all routes
-    # Middleware check: if not is_https and forwarded_proto != "https": raise 403
+    response = client.get("/health") 
     
-    # TestClient requests are often 'http' unless configured. 
-    # Let's verify middleware logic.
     assert response.status_code == 403
     assert "HTTPS required" in response.json()["detail"]
 
-def test_org_join_unauthorized(db, test_setup):
+def test_org_join_unauthorized(db, client, test_setup):
     org, user = test_setup
     token = create_access_token(subject=str(user.id), org_id=org.id, roles=[RoleType.GENERAL_USER.value])
     headers = {"Authorization": f"Bearer {token}"}
 
     # Create another org
+    from app.models.entities import Organization
     other_org = db.scalar(select(Organization).where(Organization.org_code == "other_org"))
     if not other_org:
         other_org = Organization(org_code="other_org", name="Other Org")

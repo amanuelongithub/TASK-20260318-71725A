@@ -2,12 +2,16 @@ from datetime import datetime, timedelta
 from pathlib import Path
 
 from sqlalchemy import and_, case, func, select
+from sqlalchemy.orm import Session
 
 from app.core.config import settings
 from app.core.logging import logger
 from app.db.session import SessionLocal
-from app.models.entities import AuditLog, DataValidationIssue, ExportJob, MetricsSnapshot, ProcessDefinition, ProcessInstance, ProcessStatus, Role, RoleType, Task, TaskStatus, User
-from app.services.export_service import generate_user_export_csv, generate_user_export_xlsx
+from app.models.entities import (
+    AuditLog, DataValidationIssue, ExportJob, ImportBatch, MetricsSnapshot, 
+    ProcessDefinition, ProcessInstance, ProcessStatus, Role, RoleType, Task, TaskStatus, User
+)
+from app.services.export_service import generate_export_csv, generate_export_xlsx
 from app.tasks.celery_app import celery_app
 
 
@@ -46,13 +50,10 @@ def backup_database() -> str:
     import os
     from app.core.config import settings
     # We can invoke the existing backup_db script
-    try:
-        if os.path.exists("scripts/backup_db.py"):
-            subprocess.run(["python", "scripts/backup_db.py"], check=True)
-            return "Backup executed successfully"
-        return "Backup script not found"
-    except Exception as e:
-        return f"Backup failed: {e}"
+    if os.path.exists("scripts/backup_db.py"):
+        subprocess.run(["python", "scripts/backup_db.py"], check=True)
+        return "Backup executed successfully"
+    return "Backup script not found"
 
 
 @celery_app.task(
@@ -63,8 +64,20 @@ def backup_database() -> str:
     retry_jitter=True,
     max_retries=3
 )
-def aggregate_daily_metrics(org_id: int) -> int:
-    db = SessionLocal()
+@celery_app.task(
+    name="jobs.aggregate_daily_metrics",
+    autoretry_for=(Exception,),
+    retry_backoff=True,
+    retry_backoff_max=300,
+    retry_jitter=True,
+    max_retries=3
+)
+def aggregate_daily_metrics(org_id: int, db: Session | None = None) -> int:
+    if db is None:
+        db = SessionLocal()
+        should_close = True
+    else:
+        should_close = False
     try:
         now = datetime.utcnow()
         yesterday = now - timedelta(days=1)
@@ -76,27 +89,56 @@ def aggregate_daily_metrics(org_id: int) -> int:
         )) or 0
         sla_performance = float(on_time_tasks) / total_tasks if total_tasks > 0 else 1.0
 
-        # 2. Workflow Velocity (Avg hours to complete instance)
+        # 2. Workflow Velocity (Avg duration to complete)
         avg_velocity = db.scalar(select(func.avg(
-            func.extract('epoch', ProcessInstance.sla_due_at - ProcessInstance.created_at) / 3600
-        )).where(ProcessInstance.org_id == org_id, ProcessInstance.status == ProcessStatus.COMPLETED)) or 0.0
+            func.extract('epoch', ProcessInstance.completed_at - ProcessInstance.created_at) / 3600
+        )).where(ProcessInstance.org_id == org_id, ProcessInstance.status == ProcessStatus.COMPLETED, ProcessInstance.completed_at >= yesterday)) or 0.0
 
-        # 3. Data Integrity (High severity issues)
-        high_severity_issues = db.scalar(select(func.count(DataValidationIssue.id)).where(
-            DataValidationIssue.org_id == org_id, DataValidationIssue.severity == "high", DataValidationIssue.created_at >= yesterday
+        # 3. Rejection Rate
+        rejected_tasks = db.scalar(select(func.count(Task.id)).where(
+            Task.org_id == org_id, Task.completed_at >= yesterday, Task.status == TaskStatus.REJECTED
         )) or 0
+        rejection_rate = float(rejected_tasks) / total_tasks if total_tasks > 0 else 0.0
 
-        # 4. System Usage (Participating users)
-        active_users = db.scalar(select(func.count(func.distinct(Task.assignee_id))).where(
-            Task.org_id == org_id, Task.created_at >= yesterday
+        # 4. Data Error Rate (from Data Governance)
+        total_batches = db.scalar(select(func.count(ImportBatch.id)).where(
+            ImportBatch.org_id == org_id, ImportBatch.created_at >= yesterday
         )) or 0
+        failed_batches = db.scalar(select(func.count(ImportBatch.id)).where(
+            ImportBatch.org_id == org_id, ImportBatch.created_at >= yesterday, ImportBatch.status == "failed"
+        )) or 0
+        data_error_rate = float(failed_batches) / total_batches if total_batches > 0 else 0.0
+
+        # 5. Message Reach (%)
+        # Ratio of unique users touched by a system event (task/log) vs total users
+        from app.models.entities import AuditLog, User
+        unique_touched_users = db.scalar(select(func.count(func.distinct(AuditLog.actor_id))).where(
+            AuditLog.org_id == org_id, AuditLog.created_at >= yesterday, AuditLog.actor_id.isnot(None)
+        )) or 0
+        total_org_users = db.scalar(select(func.count(User.id)).where(User.org_id == org_id, User.is_active == True)) or 1
+        message_reach = float(unique_touched_users) / total_org_users if total_org_users > 0 else 0.0
+
+        # 6. Activity Count
+        activity_count = db.scalar(select(func.count(AuditLog.id)).where(AuditLog.org_id == org_id, AuditLog.created_at >= yesterday)) or 0
+
+        # 7. Attendance Anomaly Rate (Static defect fix)
+        # Ratio of overdue pending tasks vs total active users in org
+        overdue_tasks = db.scalar(select(func.count(Task.id)).where(
+            Task.org_id == org_id, 
+            Task.status == TaskStatus.PENDING,
+            Task.sla_due_at < now
+        )) or 0
+        attendance_anomaly_rate = float(overdue_tasks) / total_org_users if total_org_users > 0 else 0.0
 
         payload = {
             "snapshot_date": now.isoformat(),
-            "sla_performance": sla_performance,
+            "work_order_sla": sla_performance,
             "avg_velocity_hours": float(avg_velocity),
-            "high_severity_issues": int(high_severity_issues),
-            "active_users": int(active_users),
+            "rejection_rate": rejection_rate,
+            "data_error_rate": data_error_rate,
+            "attendance_anomaly_rate": attendance_anomaly_rate,
+            "message_reach": message_reach,
+            "activity_index": activity_count,
             "total_completed_tasks_24h": int(total_tasks)
         }
         row = MetricsSnapshot(org_id=org_id, snapshot_date=now, payload=payload)
@@ -104,7 +146,8 @@ def aggregate_daily_metrics(org_id: int) -> int:
         db.commit()
         return row.id
     finally:
-        db.close()
+        if should_close:
+            db.close()
 
 
 @celery_app.task(
@@ -162,10 +205,13 @@ def process_export_job(self, job_id: int) -> int:
         output_path = output_dir / f"export_job_{job.id}.{extension}"
         columns = job.fields.get("columns", [])
         desensitize = bool(job.fields.get("desensitize", True))
+        entity_type = str(job.fields.get("entity_type", "users"))
+        
+        from app.services.export_service import generate_export_csv, generate_export_xlsx
         if export_format == "xlsx":
-            generate_user_export_xlsx(db, job.org_id, columns, output_path, desensitize)
+            generate_export_xlsx(db, job.org_id, entity_type, columns, output_path, desensitize)
         else:
-            generate_user_export_csv(db, job.org_id, columns, output_path, desensitize)
+            generate_export_csv(db, job.org_id, entity_type, columns, output_path, desensitize)
 
         job.output_path = str(output_path)
         job.status = "completed"
@@ -174,7 +220,7 @@ def process_export_job(self, job_id: int) -> int:
                 org_id=job.org_id,
                 actor_id=job.requested_by,
                 event="export.job_completed",
-                event_metadata={"job_id": job.id, "output_path": job.output_path},
+                event_metadata={"job_id": job.id, "filename": output_path.name}, # Redacted internal path
             )
         )
         db.commit()
@@ -188,7 +234,7 @@ def process_export_job(self, job_id: int) -> int:
                     org_id=job.org_id,
                     actor_id=job.requested_by,
                     event="export.job_failed",
-                    event_metadata={"job_id": job.id, "error": str(exc)},
+                    event_metadata={"job_id": job.id, "error": "Export generation failed due to an internal error."}, # Redacted raw exception
                 )
             )
             db.commit()
@@ -401,6 +447,7 @@ def prune_old_exports() -> int:
 def sign_audit_log_batches() -> int:
     import hashlib
     import hmac
+    import json
     
     db = SessionLocal()
     try:
@@ -414,7 +461,13 @@ def sign_audit_log_batches() -> int:
         if not logs:
             return 0
             
-        batch_content = "".join([f"{l.id}{l.event}{l.created_at.isoformat()}" for l in logs])
+        # SECURITY HARDENING: Include event_metadata and org_id in the signed payload to prevent tampering.
+        payload_parts = []
+        for l in logs:
+            meta_str = json.dumps(l.event_metadata, sort_keys=True)
+            payload_parts.append(f"{l.id}{l.org_id}{l.event}{l.created_at.isoformat()}{meta_str}")
+        
+        batch_content = "".join(payload_parts)
         batch_hash = hashlib.sha256(batch_content.encode()).hexdigest()
         signature = hmac.new(settings.secret_key.encode(), batch_hash.encode(), hashlib.sha256).hexdigest()
         

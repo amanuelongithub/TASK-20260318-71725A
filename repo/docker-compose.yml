@@ -22,6 +22,26 @@ services:
     image: redis:7
     ports:
       - "6379:6379"
+  worker:
+    build: .
+    command: celery -A app.tasks.celery_app:celery_app worker -l info
+    env_file: .env
+    depends_on:
+      - db
+      - redis
+    volumes:
+      - .:/app
+
+  beat:
+    build: .
+    command: celery -A app.tasks.celery_app:celery_app beat -l info
+    env_file: .env
+    depends_on:
+      - db
+      - redis
+    volumes:
+      - .:/app
+
   nginx:
     image: nginx:1.27
     depends_on:

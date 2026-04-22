@@ -21,12 +21,17 @@ def create_export_job(
     actor: User = Depends(require_permission("export", "create")),
 ) -> dict:
     role_name = actor.role.name.value if actor.role else ""
-    sanitized, desensitize = build_export_plan(payload.fields, role_name, payload.desensitize)
+    sanitized, desensitize = build_export_plan(payload.entity_type, payload.fields, role_name, payload.desensitize)
     export_format = payload.format if payload.format in ALLOWED_EXPORT_FORMATS else "csv"
     job = ExportJob(
         org_id=actor.org_id,
         requested_by=actor.id,
-        fields={"columns": sanitized, "desensitize": desensitize, "format": export_format},
+        fields={
+            "entity_type": payload.entity_type,
+            "columns": sanitized, 
+            "desensitize": desensitize, 
+            "format": export_format
+        },
         status="queued",
     )
     db.add(job)

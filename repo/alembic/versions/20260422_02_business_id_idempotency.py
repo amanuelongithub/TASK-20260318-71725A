@@ -17,9 +17,11 @@ depends_on = None
 
 
 def upgrade() -> None:
-    # Add unique constraint for (org_id, business_id) on process_instances
-    op.create_unique_constraint('uq_org_business_id', 'process_instances', ['org_id', 'business_id'])
+    # REMOVED: Permanent unique constraint on (org_id, business_id) 
+    # to support the prompt's 24-hour idempotency window requirement.
+    # Service logic now handles the 24-hour check.
+    pass
 
 
 def downgrade() -> None:
-    op.drop_constraint('uq_org_business_id', 'process_instances', type_='unique')
+    pass

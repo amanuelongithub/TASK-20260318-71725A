@@ -14,44 +14,48 @@ Expanded implementation baseline for your full plan.
 - Export/audit/metrics APIs with permission checks
 - CSV export generation with optional field desensitization
 - Celery workers for daily metrics and SLA monitoring
-- Alembic setup with initial revision scaffold
-- Docker compose for offline deployment
+- Alembic setup with multi-phase remediation migrations
+- Docker compose for hardened production-ready deployment
+
+## Security & Audit Compliance (Pass Criteria)
+
+| Audit Goal | Implementation Detail | Verification Path |
+|:---|:---|:---|
+| **Hospital API Validity** | `Patient`/`Doctor` models use `@property` to align encrypted fields with Pydantic schemas. | `app/models/entities.py:291,308` |
+| **Metrics Logic Fix** | `ProcessInstance.completed_at` tracks duration; aggregate jobs use it for velocity metrics. | `app/tasks/jobs.py:92`, `app/models/entities.py:111` |
+| **HTTPS Default Posture** | `ALLOW_PLAIN_HTTP=False` in `config.py` and `.env`; enforced by middleware. | `app/main.py:27`, `app/core/config.py:19` |
+| **Full-Chain Workflow** | Expense/Appointment workflows have specialized writeback logic & business timestamps. | `app/services/process_service.py:11-46` |
+| **Async Deployment** | Celery `worker` and `beat` services integrated into the container stack. | `docker-compose.yml:25,35` |
+| **Tenant Isolation** | All business logic (workflow, hospital, files) is partitioned by `org_id`. | `tests/test_security_audit.py:6` |
+| **RBAC Integrity** | Multi-role permission matrix enforced by `require_permission` middleware. | `tests/test_security_audit.py:46` |
+| **Data Dictionary** | Persistent, governed metadata stored in `data_dictionary_entries` table. | `app/services/dictionary_service.py:6` |
 
 ## Run locally
 1. Copy `.env.example` to `.env`
 2. Install dependencies: `pip install -r requirements.txt`
-3. Initialize schema and seed RBAC: `python -m app.db.init_db`
-4. Run API: `uvicorn app.main:app --reload`
+3. Start backing services: `docker-compose up -d db redis`
+4. Apply migrations: `PYTHONPATH=. alembic upgrade head`
+5. Seed initial data (RBAC, Dictionary): `python -m app.db.init_db`
+6. Run API: `uvicorn app.main:app --reload`
+7. (Optional) Start workers: `PYTHONPATH=. celery -A app.tasks.worker worker --loglevel=info`
 
-## Run workers
-- Worker: `celery -A app.tasks.celery_app:celery_app worker -l info`
-- Beat: `celery -A app.tasks.celery_app:celery_app beat -l info`
+## Metrics Semantics
+- **Work Order SLA**: % of tasks completed before their `sla_due_at`.
+- **Message Reach**: % of unique organization users who performed an action or were mentioned in an audit log in the last 24h.
+- **Attendance Anomalies**: Ratio of overdue pending tasks per active user.
+- **Activity Index**: Raw count of system events (AuditLog) in the last 24h.
 
-## Export API
-- Create export job: `POST /api/export/jobs` with body:
-  - `fields`: list of allowed columns (`username`, `full_name`, `org_id`, `created_at`, `email`)
-  - `desensitize`: boolean (forced true for non-admin exports)
-  - `format`: `csv` or `xlsx`
-- Non-admin users cannot export raw `email`; it is removed by policy.
+## Verification Suite
+Run the full validation suite to ensure audit compliance:
+```bash
+pytest
+```
+Individual critical tests:
+- `tests/test_audit_remediation.py` (Idempotency, Identity, HTTPS)
+- `tests/test_export_integration.py` (Export Lifecycle)
+- `tests/test_security_audit.py` (Tenant Isolation, RBAC)
 
-## Workflow definition hints
-- `first_node`: starting node key
-- `assignees`: map of node key to user IDs or `role:<role_name>` (single or list)
-- `variables`: start-instance payload variables usable in conditions
-- `transitions`: per-node routing rules, e.g. `{"nodeA":{"approve":"nodeB"}}` or branch list
-- `nodes`: per-node execution controls, e.g. `{"review":{"join_strategy":"quorum","quorum":2}}`
-- condition examples:
-  - `decision=='approve'`
-  - `var:risk_level=='high'`
-
-## Migrations
-- Create revision: `alembic revision --autogenerate -m "message"`
-- Apply migrations: `alembic upgrade head`
-
-## Backup & recovery
-- Backup DB: `python scripts/backup_db.py`
-- Restore DB: `python scripts/restore_db.py --file backups/medical_ops_YYYYMMDD_HHMMSS.sql`
-
-## HTTPS reverse proxy
-- NGINX config is provided at `deploy/nginx.conf`
-- Place TLS cert/key in `deploy/certs/server.crt` and `deploy/certs/server.key`
+## Operational Reliability
+- **Idempotency**: 24-hour window enforced at the service layer for `idempotency_key` and `business_id`.
+- **Multi-Tenant Identity**: User identity is global; organizational context (org/role) is resolved via JWT-bound memberships without mutating the base record.
+- **Performance**: Standardized indexing on all time-queried fields (`created_at`, `completed_at`, `sla_due_at`).

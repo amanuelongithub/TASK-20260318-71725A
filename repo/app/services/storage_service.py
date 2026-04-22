@@ -27,12 +27,16 @@ async def save_attachment(
     if business_owner_id:
         # Check if the business entity exists and belongs to the actor's organization
         # Generic check for common entity types based on prefixes
-        from app.models.entities import Expense, Appointment, ProcessInstance
+        from app.models.entities import Expense, Appointment, ProcessInstance, ResourceApplication, CreditChange
         is_valid = False
         if business_owner_id.startswith("EXP-"):
             is_valid = db.scalar(select(Expense).where(Expense.expense_number == business_owner_id, Expense.org_id == actor.org_id)) is not None
         elif business_owner_id.startswith("APT-"):
             is_valid = db.scalar(select(Appointment).where(Appointment.appointment_number == business_owner_id, Appointment.org_id == actor.org_id)) is not None
+        elif business_owner_id.startswith("RES-"):
+            is_valid = db.scalar(select(ResourceApplication).where(ResourceApplication.application_number == business_owner_id, ResourceApplication.org_id == actor.org_id)) is not None
+        elif business_owner_id.startswith("CRD-"):
+            is_valid = db.scalar(select(CreditChange).where(CreditChange.change_number == business_owner_id, CreditChange.org_id == actor.org_id)) is not None
         elif business_owner_id.startswith("PROC-") or business_owner_id.isdigit():
              is_valid = db.scalar(select(ProcessInstance).where(ProcessInstance.business_id == business_owner_id, ProcessInstance.org_id == actor.org_id)) is not None
         
@@ -41,14 +45,27 @@ async def save_attachment(
             # The audit suggests strictly validating this.
             raise HTTPException(status_code=403, detail="Invalid or unauthorized business entity ID")
 
-    # Validate task_id and process_instance_id if provided
+    # Validate task_id and process_instance_id linkage and organization ownership
+    from app.models.entities import Task, ProcessInstance
     if task_id:
-        from app.models.entities import Task
         task = db.scalar(select(Task).where(Task.id == task_id, Task.org_id == actor.org_id))
         if not task:
             raise HTTPException(status_code=404, detail="Task not found or unauthorized")
-        if not process_instance_id:
-            process_instance_id = task.process_instance_id
+        
+        if process_instance_id and process_instance_id != task.process_instance_id:
+            raise HTTPException(status_code=400, detail="Inconsistent linkage: task_id does not belong to the provided process_instance_id")
+        
+        process_instance_id = task.process_instance_id
+
+    if process_instance_id:
+        instance = db.scalar(select(ProcessInstance).where(ProcessInstance.id == process_instance_id, ProcessInstance.org_id == actor.org_id))
+        if not instance:
+            raise HTTPException(status_code=404, detail="Process instance not found or unauthorized")
+        
+        # Verify cross-linkage if business_owner_id is also provided
+        if business_owner_id:
+            if (business_owner_id.startswith("PROC-") or business_owner_id.isdigit()) and instance.business_id != business_owner_id:
+                raise HTTPException(status_code=400, detail="Inconsistent linkage: process_instance_id does not match business_owner_id")
 
     content = await upload.read()
     # Reset read pointer for potential re-read or storage
@@ -59,15 +76,21 @@ async def save_attachment(
         raise HTTPException(status_code=400, detail=f"File exceeds {settings.max_file_size_mb}MB")
 
     fingerprint = file_sha256(content)
-    existing = db.scalar(select(Attachment).where(Attachment.org_id == actor.org_id, Attachment.sha256 == fingerprint))
-    if existing:
-        return {"attachment_id": existing.id, "sha256": existing.sha256, "deduplicated": True}
+    
+    # REVISED Traceability Logic:
+    # 1. Reuse disk storage path if content exists (Disk Deduplication)
+    existing_file = db.scalar(select(Attachment).where(Attachment.sha256 == fingerprint).limit(1))
+    if existing_file and Path(existing_file.storage_path).exists():
+        file_path = Path(existing_file.storage_path)
+        deduplicated = True
+    else:
+        storage = Path(settings.file_storage_path)
+        storage.mkdir(parents=True, exist_ok=True)
+        file_path = storage / f"{fingerprint}_{upload.filename}"
+        file_path.write_bytes(content)
+        deduplicated = False
 
-    storage = Path(settings.file_storage_path)
-    storage.mkdir(parents=True, exist_ok=True)
-    file_path = storage / f"{fingerprint}_{upload.filename}"
-    file_path.write_bytes(content)
-
+    # 2. ALWAYS create a new DB record for this specific upload/link (Traceability)
     row = Attachment(
         org_id=actor.org_id,
         uploader_id=actor.id,
@@ -119,10 +142,9 @@ async def save_attachment(
     db.commit()
     db.refresh(row)
     return {
-
-        "attachment_id": row.id, 
-        "sha256": row.sha256, 
-        "deduplicated": False, 
+        "attachment_id": row.id,
+        "sha256": row.sha256,
+        "deduplicated": deduplicated,
         "validation_status": validation_status
     }
 
@@ -181,6 +203,30 @@ def get_attachment(db: Session, actor: User, attachment_id: int) -> Attachment:
                 if expense.submitted_by == actor.id:
                     is_authorized = True
                     access_reason = "expense_owner"
+                elif actor.role.name in {RoleType.ADMIN, RoleType.AUDITOR}:
+                    is_authorized = True
+                    access_reason = f"{actor.role.name.value}_oversight"
+
+        if not is_authorized:
+            # Check if it's a ResourceApplication
+            from app.models.entities import ResourceApplication
+            res_app = db.scalar(select(ResourceApplication).where(ResourceApplication.application_number == row.business_owner_id, ResourceApplication.org_id == actor.org_id))
+            if res_app:
+                if res_app.applicant_id == actor.id:
+                    is_authorized = True
+                    access_reason = "resource_applicant"
+                elif actor.role.name in {RoleType.ADMIN, RoleType.AUDITOR}:
+                    is_authorized = True
+                    access_reason = f"{actor.role.name.value}_oversight"
+
+        if not is_authorized:
+            # Check if it's a CreditChange
+            from app.models.entities import CreditChange
+            crd_change = db.scalar(select(CreditChange).where(CreditChange.change_number == row.business_owner_id, CreditChange.org_id == actor.org_id))
+            if crd_change:
+                if crd_change.target_user_id == actor.id:
+                    is_authorized = True
+                    access_reason = "credit_target"
                 elif actor.role.name in {RoleType.ADMIN, RoleType.AUDITOR}:
                     is_authorized = True
                     access_reason = f"{actor.role.name.value}_oversight"

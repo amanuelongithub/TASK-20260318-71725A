@@ -1,4 +1,6 @@
+from typing import Any
 from datetime import datetime, timedelta
+import json
 
 from fastapi import HTTPException
 from sqlalchemy import and_, func, select
@@ -8,17 +10,82 @@ from app.models.entities import ProcessDefinition, ProcessInstance, ProcessStatu
 from app.schemas.process import CreateProcessDefinitionRequest
 from app.services.audit_service import log_event
 
-def _perform_writeback(db: Session, business_id: str, new_status: str):
-    from app.models.entities import Expense, Appointment, Patient, Doctor
-    if not business_id: return
+def _perform_writeback(db: Session, org_id: int, business_id: str, new_status: str):
+    from app.models.entities import Expense, Appointment, ResourceApplication, CreditChange
+    if not business_id: 
+        return
+        
+    now = datetime.utcnow()
     if business_id.startswith("EXP-"):
-        entity = db.scalar(select(Expense).where(Expense.expense_number == business_id))
+        entity = db.scalar(
+            select(Expense).where(
+                Expense.org_id == org_id,
+                Expense.expense_number == business_id
+            )
+        )
         if entity:
             entity.status = new_status
+            if new_status == "approved":
+                entity.approved_at = now
+            # Full-chain: ensure business audit trail is linked
+            log_event(db, org_id, None, "hospital.expense_writeback", {
+                "business_id": business_id, 
+                "new_status": new_status,
+                "timestamp": now.isoformat()
+            })
     elif business_id.startswith("APT-"):
-        entity = db.scalar(select(Appointment).where(Appointment.appointment_number == business_id))
+        entity = db.scalar(
+            select(Appointment).where(
+                Appointment.org_id == org_id,
+                Appointment.appointment_number == business_id
+            )
+        )
         if entity:
             entity.status = new_status
+            if new_status == "approved":
+                # For appointments, 'approved' state maps to 'scheduled' in the domain model
+                entity.status = "scheduled"
+                entity.scheduled_at = now
+            # Full-chain: ensure business audit trail is linked
+            log_event(db, org_id, None, "hospital.appointment_writeback", {
+                "business_id": business_id, 
+                "new_status": new_status,
+                "timestamp": now.isoformat()
+            })
+    elif business_id.startswith("RES-"):
+        bid = business_id.strip()
+        entity = db.scalar(
+            select(ResourceApplication).where(
+                ResourceApplication.org_id == org_id,
+                ResourceApplication.application_number == bid
+            )
+        )
+        if entity:
+            entity.status = new_status
+            if new_status == "approved":
+                entity.approved_at = now
+            db.flush()
+        else:
+            log_event(db, org_id, None, "hospital.resource_writeback_failed", {
+                "business_id": business_id, 
+                "error": "Entity not found"
+            })
+    elif business_id.startswith("CRD-"):
+        entity = db.scalar(
+            select(CreditChange).where(
+                CreditChange.org_id == org_id,
+                CreditChange.change_number == business_id
+            )
+        )
+        if entity:
+            entity.status = new_status
+            if new_status == "approved":
+                entity.approved_at = now
+            log_event(db, org_id, None, "hospital.credit_writeback", {
+                "business_id": business_id, 
+                "new_status": new_status,
+                "timestamp": now.isoformat()
+            })
 
 
 
@@ -37,16 +104,42 @@ def _condition_matches(condition: str | None, context: dict) -> bool:
     return False
 
 
-def _resolve_next_nodes(definition: dict, node_key: str, decision: str, variables: dict | None = None) -> list[str]:
-    transitions = definition.get("transitions", {})
+def _get_definition_dict(obj: Any) -> dict:
+    if obj is None:
+        return {}
+    raw = getattr(obj, "definition", obj)
+    if isinstance(raw, dict):
+        return raw
+    if isinstance(raw, str):
+        try:
+            return json.loads(raw)
+        except Exception:
+            return {}
+    return {}
+
+def _resolve_next_nodes(definition: dict | str, node_key: str, decision: str, variables: dict | None = None) -> list[str]:
+    actual_defn = _get_definition_dict(definition)
+    # Handle nested "definition" key if present
+    if "definition" in actual_defn and isinstance(actual_defn["definition"], dict):
+        actual_defn = actual_defn["definition"]
+        
+    transitions = actual_defn.get("transitions", {})
     node_rules = transitions.get(node_key, {})
+    
     candidates = node_rules.get("branches", [])
     if candidates:
         for branch in candidates:
             if _condition_matches(branch.get("when"), {"decision": decision, "variables": variables or {}}):
                 next_nodes = branch.get("next", [])
                 return next_nodes if isinstance(next_nodes, list) else [next_nodes]
-    mapped = node_rules.get(decision)
+    
+    mapped = None
+    target = decision.strip().lower()
+    for key, val in node_rules.items():
+        if str(key).strip().lower() == target:
+            mapped = val
+            break
+            
     if mapped is None:
         return []
     return mapped if isinstance(mapped, list) else [mapped]
@@ -120,14 +213,17 @@ def start_process(
     idempotency_key: str,
     variables: dict | None = None,
 ) -> ProcessInstance:
-    # Idempotency check - DURABLY guaranteed by unique constraint on (org_id, business_id)
-    # the 24-hour window is removed to ensure absolute uniqueness as per audit requirements.
+    now = datetime.utcnow()
+    # Idempotency check: Return existing only if within the required 24-hour window.
+    # After 24 hours, a new submission with the same business_id is permitted.
+    day_ago = now - timedelta(hours=24)
     existing = db.scalar(
         select(ProcessInstance).where(
             and_(
                 ProcessInstance.org_id == actor.org_id,
                 ((ProcessInstance.idempotency_key == idempotency_key) | 
-                 (ProcessInstance.business_id == business_id))
+                 (ProcessInstance.business_id == business_id)),
+                ProcessInstance.created_at >= day_ago
             )
         )
     )
@@ -144,11 +240,11 @@ def start_process(
     if definition is None:
         raise HTTPException(status_code=404, detail="Process definition not found")
 
-    first_node = definition.definition.get("first_node", "start")
-    node_cfg = definition.definition.get("nodes", {}).get(first_node, {})
-    timeout_hours = int(node_cfg.get("timeout_hours", 48))
+    defn_dict = _get_definition_dict(definition)
     
-    from sqlalchemy.exc import IntegrityError
+    first_node = defn_dict.get("first_node", "start")
+    node_cfg = defn_dict.get("nodes", {}).get(first_node, {})
+    timeout_hours = int(node_cfg.get("timeout_hours", 48))
     
     instance = ProcessInstance(
         org_id=actor.org_id,
@@ -162,24 +258,10 @@ def start_process(
         sla_due_at=now + timedelta(hours=48), # Global SLA aligned to prompt
     )
     db.add(instance)
-    try:
-        db.flush()
-    except IntegrityError:
-        db.rollback()
-        # Fetch the existing instance that caused the conflict
-        existing = db.scalar(
-            select(ProcessInstance).where(
-                and_(
-                    ProcessInstance.org_id == actor.org_id,
-                    ((ProcessInstance.idempotency_key == idempotency_key) | 
-                     (ProcessInstance.business_id == business_id))
-                )
-            )
-        )
-        if existing:
-            return existing
-        raise # Rethrow if we can't find it for some reason
-    raw_assignees = definition.definition.get("assignees", {}).get(first_node, [actor.id])
+    db.flush() # Ensure instance.id is populated for child Task records
+    # The unique constraint on idempotency_key has been removed from the DB to support the 24-hour rule.
+    # We now rely on the explicit window check above.
+    raw_assignees = defn_dict.get("assignees", {}).get(first_node, [actor.id])
     assignees = _resolve_assignees(db, actor.org_id, actor.id, raw_assignees)
     due = now + timedelta(hours=timeout_hours)
     for assignee_id in assignees:
@@ -212,17 +294,20 @@ def complete_task(db: Session, actor: User, task_id: int, decision: str, comment
     if instance is None:
         raise HTTPException(status_code=404, detail="Process instance not found")
 
-    normalized = decision.lower()
+    normalized = decision.strip().lower()
     if normalized not in {"approve", "reject"}:
         raise HTTPException(status_code=400, detail="Decision must be approve or reject")
 
     task.status = TaskStatus.APPROVED if normalized == "approve" else TaskStatus.REJECTED
     task.comment = comment
     task.completed_at = datetime.utcnow()
+    db.flush() # CRITICAL: Ensure status is in DB for _should_advance_from_node query
     definition = db.scalar(select(ProcessDefinition).where(ProcessDefinition.id == instance.process_definition_id))
     if definition is None:
         raise HTTPException(status_code=404, detail="Process definition not found")
 
+    defn_dict = _get_definition_dict(definition)
+    
     if normalized == "reject":
         sibling_tasks = db.scalars(
             select(Task).where(
@@ -238,9 +323,10 @@ def complete_task(db: Session, actor: User, task_id: int, decision: str, comment
             sibling.completed_at = datetime.utcnow()
         instance.status = ProcessStatus.REJECTED
         instance.current_node = "rejected"
-        _perform_writeback(db, instance.business_id, "rejected")
+        instance.completed_at = datetime.utcnow()
+        _perform_writeback(db, instance.org_id, instance.business_id, "rejected")
     else:
-        should_advance = _should_advance_from_node(db, definition.definition, task.process_instance_id, task.node_key)
+        should_advance = _should_advance_from_node(db, defn_dict, task.process_instance_id, task.node_key)
         if not should_advance:
             log_event(
                 db,
@@ -264,11 +350,11 @@ def complete_task(db: Session, actor: User, task_id: int, decision: str, comment
             sibling.comment = "Auto-completed by join strategy"
             sibling.completed_at = datetime.utcnow()
 
-        next_nodes = _resolve_next_nodes(definition.definition, task.node_key, "approve", instance.variables)
+        next_nodes = _resolve_next_nodes(defn_dict, task.node_key, normalized, instance.variables)
         if next_nodes:
             instance.current_node = ",".join(next_nodes)
-            assignees_map = definition.definition.get("assignees", {})
-            nodes_cfg = definition.definition.get("nodes", {})
+            assignees_map = defn_dict.get("assignees", {})
+            nodes_cfg = defn_dict.get("nodes", {})
             for next_node in next_nodes:
                 node_cfg = nodes_cfg.get(next_node, {})
                 timeout_hours = int(node_cfg.get("timeout_hours", 48))
@@ -293,7 +379,8 @@ def complete_task(db: Session, actor: User, task_id: int, decision: str, comment
         else:
             instance.status = ProcessStatus.COMPLETED
             instance.current_node = "completed"
-            _perform_writeback(db, instance.business_id, "approved")
+            instance.completed_at = datetime.utcnow()
+            _perform_writeback(db, instance.org_id, instance.business_id, "approved")
 
     log_event(db, actor.org_id, actor.id, "process.task_completed", {"task_id": task_id, "decision": normalized, "instance_id": instance.id})
     db.commit()

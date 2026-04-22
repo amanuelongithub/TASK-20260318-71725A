@@ -25,6 +25,14 @@ def decrypt_field(value: bytes) -> str:
     return _fernet().decrypt(value).decode("utf-8")
 
 
+def deterministic_hash(value: str | None) -> str:
+    if value is None:
+        return ""
+    import hmac
+    # Use HMAC with the secret key for deterministic but keyed hashing
+    return hmac.new(settings.secret_key.encode(), value.encode(), hashlib.sha256).hexdigest()
+
+
 def file_sha256(content: bytes) -> str:
     return hashlib.sha256(content).hexdigest()
 

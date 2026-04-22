@@ -14,6 +14,7 @@ class RegisterRequest(BaseModel):
     password: str = Field(min_length=8, max_length=64)
     full_name: str | None = None
     email: str | None = None
+    invitation_token: str | None = None # Required if joining existing org
 
     @field_validator("password")
     @classmethod
@@ -48,3 +49,23 @@ class PasswordResetConfirm(BaseModel):
 
 class JoinOrganizationRequest(BaseModel):
     org_code: str
+
+
+class AddMemberRequest(BaseModel):
+    username: str
+    role: str = "general_user"
+
+
+class InvitationRequest(BaseModel):
+    email_or_username: str
+    role: str = "general_user"
+
+
+class InvitationResponse(BaseModel):
+    invitation_id: int
+    token: str
+    expires_at: str
+
+
+class JoinInvitationRequest(BaseModel):
+    token: str

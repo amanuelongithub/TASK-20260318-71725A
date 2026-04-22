@@ -1,0 +1,161 @@
+2026-04-22 04:40:46,924 [DEBUG] celery.utils.functional: 
+def aggregate_daily_metrics(org_id, db=0):
+    return 1
+
+============================= test session starts =============================
+platform win32 -- Python 3.12.2, pytest-9.0.3, pluggy-1.6.0 -- C:\Users\Hp\AppData\Local\Programs\Python\Python312\python.exe
+cachedir: .pytest_cache
+rootdir: C:\Users\Hp\Desktop\Root\Job\WeVenture\TASK-20260318-71725A\repo
+configfile: pyproject.toml
+plugins: anyio-4.6.0
+collecting ... collected 1 item
+
+tests/test_audit_final_verification.py::test_e2e_resource_application_workflow 2026-04-22 04:40:48,823 [DEBUG] asyncio: Using proactor: IocpProactor
+2026-04-22 04:40:49,210 [INFO] httpx: HTTP Request: POST http://testserver/api/hospital/resource-applications "HTTP/1.1 200 OK"
+2026-04-22 04:40:49,282 [INFO] httpx: HTTP Request: POST http://testserver/api/process/instances "HTTP/1.1 200 OK"
+2026-04-22 04:40:49,346 [INFO] httpx: HTTP Request: POST http://testserver/api/process/tasks/1/complete "HTTP/1.1 200 OK"
+2026-04-22 04:40:49,385 [INFO] httpx: HTTP Request: POST http://testserver/api/process/tasks/2/complete "HTTP/1.1 200 OK"
+2026-04-22 04:40:49,423 [INFO] httpx: HTTP Request: POST http://testserver/api/process/tasks/3/complete "HTTP/1.1 200 OK"
+2026-04-22 04:40:49,448 [INFO] httpx: HTTP Request: GET http://testserver/api/hospital/resource-applications?status=approved "HTTP/1.1 200 OK"
+FAILED
+
+================================== FAILURES ===================================
+___________________ test_e2e_resource_application_workflow ____________________
+
+client = <starlette.testclient.TestClient object at 0x00000286A7AE9BB0>
+db = <sqlalchemy.orm.session.Session object at 0x00000286A70EB6E0>
+
+    def test_e2e_resource_application_workflow(client, db):
+        # Setup: Full environment
+        init_db(db)
+        org = db.scalar(select(Organization).limit(1))
+        admin_role = db.scalar(select(Role).where(Role.name == RoleType.ADMIN))
+    
+        user = User(username="e2e_user", hashed_password="...", org_id=org.id, role_id=admin_role.id)
+        db.add(user)
+    
+        reviewer_role = db.scalar(select(Role).where(Role.name == RoleType.REVIEWER))
+        reviewer = User(username="reviewer_user", hashed_password="...", org_id=org.id, role_id=reviewer_role.id)
+        db.add(reviewer)
+    
+        db.flush()
+        db.add(OrganizationMembership(user_id=user.id, org_id=org.id, role_id=admin_role.id))
+        db.add(OrganizationMembership(user_id=reviewer.id, org_id=org.id, role_id=reviewer_role.id))
+        db.commit()
+    
+        token = create_access_token(subject=str(user.id), org_id=org.id, roles=["administrator"])
+        headers = {"Authorization": f"Bearer {token}"}
+    
+        # 1. Create a Resource Application via Public API
+        resp = client.post("/api/hospital/resource-applications", json={
+            "application_number": "RES-001",
+            "resource_name": "Ventilator",
+            "quantity": 5,
+            "status": "pending"
+        }, headers=headers)
+        assert resp.status_code == 200
+        res_app_id = resp.json()["id"]
+    
+        # 2. Define and Start Process (Manual to ensure no seed nesting issues)
+        workflow_defn = {
+            "first_node": "submit",
+            "nodes": {
+                "submit": {"timeout_hours": 24},
+                "manager_review": {"timeout_hours": 48},
+                "finance_approval": {"timeout_hours": 72}
+            },
+            "transitions": {
+                "submit": {"approve": "manager_review"},
+                "manager_review": {"approve": "finance_approval", "reject": "submit"},
+                "finance_approval": {"approve": "completed", "reject": "manager_review"}
+            }
+        }
+        defn = ProcessDefinition(org_id=org.id, name="Manual E2E Flow", definition=workflow_defn)
+        db.add(defn)
+        db.commit()
+    
+        resp = client.post("/api/process/instances", json={
+            "process_definition_id": defn.id,
+            "business_id": "RES-001",
+            "idempotency_key": "IDEM-RES-001-MANUAL",
+            "variables": {}
+        }, headers=headers)
+        assert resp.status_code == 200
+        instance_id = resp.json()["id"]
+    
+        # 3. Verify Task creation and ID linkage (Regression Proof)
+        db.expire_all()
+        task = db.scalar(select(Task).where(Task.process_instance_id == instance_id))
+        assert task is not None
+        assert task.process_instance_id == instance_id
+    
+        # 4. Complete Tasks to trigger writeback
+        # First node is 'submit', but in our seed the first node is actually 'submit' (wait, let's check seed)
+        # Transitions: submit -> manager_review -> finance_approval -> completed
+    
+        # Complete 'submit'
+        resp = client.post(f"/api/process/tasks/{task.id}/complete", json={"decision": "approve"}, headers=headers)
+        assert resp.status_code == 200
+    
+        # Get next task (manager_review)
+        db.expire_all()
+        tasks = db.scalars(select(Task).where(Task.process_instance_id == instance_id)).all()
+        task2 = next((t for t in tasks if t.node_key == "manager_review"), None)
+    
+        if task2 is None:
+            db.expire_all()
+            tasks = db.scalars(select(Task).where(Task.process_instance_id == instance_id)).all()
+    
+        assert task2 is not None, f"Manager review task not found. Available nodes: {[t.node_key for t in tasks]}"
+        client.post(f"/api/process/tasks/{task2.id}/complete", json={"decision": "approve"}, headers=headers)
+    
+        # Get next task (finance_approval)
+        db.expire_all()
+        tasks = db.scalars(select(Task).where(Task.process_instance_id == instance_id)).all()
+        task3 = next((t for t in tasks if t.node_key == "finance_approval"), None)
+        assert task3 is not None
+        client.post(f"/api/process/tasks/{task3.id}/complete", json={"decision": "approve"}, headers=headers)
+    
+        # 5. Verify Writeback via Search API (End-to-End)
+        resp = client.get(f"/api/hospital/resource-applications?status=approved", headers=headers)
+        assert resp.status_code == 200
+        results = resp.json() # The endpoint returns list[ResourceApplicationOut]
+>       assert any(r["application_number"] == "RES-001" and r["status"] == "approved" for r in results)
+E       assert False
+E        +  where False = any(<generator object test_e2e_resource_application_workflow.<locals>.<genexpr> at 0x00000286A78C1CB0>)
+
+tests\test_audit_final_verification.py:132: AssertionError
+----------------------------- Captured log setup ------------------------------
+DEBUG    asyncio:proactor_events.py:634 Using proactor: IocpProactor
+------------------------------ Captured log call ------------------------------
+INFO     httpx:_client.py:1038 HTTP Request: POST http://testserver/api/hospital/resource-applications "HTTP/1.1 200 OK"
+INFO     httpx:_client.py:1038 HTTP Request: POST http://testserver/api/process/instances "HTTP/1.1 200 OK"
+INFO     httpx:_client.py:1038 HTTP Request: POST http://testserver/api/process/tasks/1/complete "HTTP/1.1 200 OK"
+INFO     httpx:_client.py:1038 HTTP Request: POST http://testserver/api/process/tasks/2/complete "HTTP/1.1 200 OK"
+INFO     httpx:_client.py:1038 HTTP Request: POST http://testserver/api/process/tasks/3/complete "HTTP/1.1 200 OK"
+INFO     httpx:_client.py:1038 HTTP Request: GET http://testserver/api/hospital/resource-applications?status=approved "HTTP/1.1 200 OK"
+============================== warnings summary ===============================
+tests/test_audit_final_verification.py: 34 warnings
+  C:\Users\Hp\AppData\Local\Programs\Python\Python312\Lib\site-packages\sqlalchemy\sql\schema.py:3624: DeprecationWarning: datetime.datetime.utcnow() is deprecated and scheduled for removal in a future version. Use timezone-aware objects to represent datetimes in UTC: datetime.datetime.now(datetime.UTC).
+    return util.wrap_callable(lambda ctx: fn(), fn)  # type: ignore
+
+tests/test_audit_final_verification.py::test_e2e_resource_application_workflow
+  C:\Users\Hp\Desktop\Root\Job\WeVenture\TASK-20260318-71725A\repo\app\services\process_service.py:216: DeprecationWarning: datetime.datetime.utcnow() is deprecated and scheduled for removal in a future version. Use timezone-aware objects to represent datetimes in UTC: datetime.datetime.now(datetime.UTC).
+    now = datetime.utcnow()
+
+tests/test_audit_final_verification.py::test_e2e_resource_application_workflow
+tests/test_audit_final_verification.py::test_e2e_resource_application_workflow
+tests/test_audit_final_verification.py::test_e2e_resource_application_workflow
+  C:\Users\Hp\Desktop\Root\Job\WeVenture\TASK-20260318-71725A\repo\app\services\process_service.py:303: DeprecationWarning: datetime.datetime.utcnow() is deprecated and scheduled for removal in a future version. Use timezone-aware objects to represent datetimes in UTC: datetime.datetime.now(datetime.UTC).
+    task.completed_at = datetime.utcnow()
+
+tests/test_audit_final_verification.py::test_e2e_resource_application_workflow
+tests/test_audit_final_verification.py::test_e2e_resource_application_workflow
+tests/test_audit_final_verification.py::test_e2e_resource_application_workflow
+  C:\Users\Hp\Desktop\Root\Job\WeVenture\TASK-20260318-71725A\repo\app\services\process_service.py:361: DeprecationWarning: datetime.datetime.utcnow() is deprecated and scheduled for removal in a future version. Use timezone-aware objects to represent datetimes in UTC: datetime.datetime.now(datetime.UTC).
+    due = datetime.utcnow() + timedelta(hours=timeout_hours)
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+=========================== short test summary info ===========================
+FAILED tests/test_audit_final_verification.py::test_e2e_resource_application_workflow
+======================= 1 failed, 41 warnings in 2.83s ========================

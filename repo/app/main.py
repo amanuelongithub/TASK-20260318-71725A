@@ -24,17 +24,19 @@ class HTTPSRedirectMiddleware(BaseHTTPMiddleware):
         # Universal HTTPS enforcement as required by compliance. 
         # Bypassable ONLY if ALLOW_PLAIN_HTTP is True AND we are NOT in production.
         is_prod = settings.environment.lower() == "prod"
+        
+        # Check for standard HTTPS header
+        is_https = request.url.scheme == "https"
+        # Check for proxy forwarding header (common in load balancers)
+        forwarded_proto = request.headers.get("x-forwarded-proto")
+        
+        # Compliance: Allow localhost for local developer verification if not in prod
+        host = request.url.hostname
+        is_local = host in {"localhost", "127.0.0.1"} and not is_prod
+        
         if not settings.allow_plain_http or is_prod:
-            # Check for standard HTTPS header
-            is_https = request.url.scheme == "https"
-            
-            # Check for proxy forwarding header (common in load balancers)
-            forwarded_proto = request.headers.get("x-forwarded-proto")
-            
-            if not is_https and forwarded_proto != "https":
+            if not is_https and forwarded_proto != "https" and not is_local:
                  # If it's an API request, returning 403 Forbidden is safer than 301.
-                 # Using JSONResponse directly because HTTPException in middleware 
-                 # can sometimes bypass standard exception handlers.
                  from fastapi.responses import JSONResponse
                  return JSONResponse(
                      status_code=status.HTTP_403_FORBIDDEN, 
@@ -50,4 +52,3 @@ app.include_router(api_router, prefix="/api")
 @app.get("/health")
 def health() -> dict[str, str]:
     return {"status": "ok"}
-

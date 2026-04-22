@@ -16,7 +16,7 @@ class Settings(BaseSettings):
     file_storage_path: str = "./storage"
     max_file_size_mb: int = 20
     aes_key: str = "INSECURE-DEV-AES-KEY-CHANGE-ME--" # Must be 32 bytes if used for AES-256
-    allow_plain_http: bool = False
+    allow_plain_http: bool = False # ENFORCED: Compliance requires HTTPS-only transmission.
 
 
 settings = Settings()

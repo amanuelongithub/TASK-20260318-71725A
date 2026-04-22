@@ -1,13 +1,17 @@
 from sqlalchemy import select
+from sqlalchemy.orm import Session
 
 from app.db.base import Base
 from app.db.session import SessionLocal, engine
 from app.models.entities import Role, RolePermission, RoleType
 
-
-def init_db() -> None:
-    Base.metadata.create_all(bind=engine)
-    db = SessionLocal()
+def init_db(db: Session | None = None) -> None:
+    if db is None:
+        Base.metadata.create_all(bind=engine)
+        db = SessionLocal()
+        should_close = True
+    else:
+        should_close = False
     try:
         for role_type in RoleType:
             if db.scalar(select(Role).where(Role.name == role_type)) is None:
@@ -26,12 +30,17 @@ def init_db() -> None:
                 ("data_governance", "read"),
                 ("data_governance", "write"),
                 ("hospital", "read"),
-
+                ("hospital", "create"),
+                ("hospital", "update"),
                 ("files", "read"),
                 ("files", "write"),
+                ("org", "read"),
+                ("org", "update"),
+                ("membership", "write"),
+                ("dictionary", "read"),
             ],
-            RoleType.REVIEWER: [("process", "approve"), ("metrics", "read"), ("hospital", "read"), ("files", "read")],
-            RoleType.GENERAL_USER: [("process", "create"), ("metrics", "read"), ("hospital", "read"), ("files", "read"), ("files", "write")],
+            RoleType.REVIEWER: [("process", "approve"), ("metrics", "read"), ("hospital", "read"), ("hospital", "create"), ("hospital", "update"), ("files", "read"), ("dictionary", "read")],
+            RoleType.GENERAL_USER: [("process", "create"), ("metrics", "read"), ("hospital", "read"), ("hospital", "create"), ("hospital", "update"), ("files", "read"), ("files", "write"), ("dictionary", "read")],
             RoleType.AUDITOR: [
                 ("audit", "read"),
                 ("metrics", "read"),
@@ -39,6 +48,7 @@ def init_db() -> None:
                 ("data_governance", "read"),
                 ("export", "read"),
                 ("files", "read"),
+                ("dictionary", "read"),
             ],
         }
 
@@ -87,7 +97,7 @@ def init_db() -> None:
                 }
             },
             {
-                "name": "Credit Approval Flow",
+                "name": "Credit Change Flow",
                 "definition": {
                     "first_node": "data_entry",
                     "nodes": {
@@ -113,11 +123,40 @@ def init_db() -> None:
             }
         ]
         for ex in examples:
-            if not db.scalar(select(ProcessDefinition).where(ProcessDefinition.name == ex["name"])):
+            if not db.scalar(select(ProcessDefinition).where(ProcessDefinition.name == ex["name"], ProcessDefinition.org_id == 1)):
                 db.add(ProcessDefinition(org_id=1, name=ex["name"], definition=ex["definition"]))
         db.commit()
+
+        # Seed Data Dictionary
+        from app.models.entities import DataDictionaryEntry
+        dictionary_data = [
+            ("User", "username", "Unique identifying name for login", "String", "Medium"),
+            ("User", "email_encrypted", "Contact email address (stored encrypted)", "LargeBinary", "High"),
+            ("Patient", "patient_number_encrypted", "Unique medical record number (MRN) - Encrpyted", "LargeBinary", "High"),
+            ("Patient", "patient_number_hash", "Blind index for searching patient number", "String", "Medium"),
+            ("Patient", "full_name", "Legal name of the patient", "String", "High"),
+            ("Doctor", "license_number_encrypted", "Professional license ID - Encrypted", "LargeBinary", "High"),
+            ("Doctor", "license_number_hash", "Blind index for searching license number", "String", "Medium"),
+            ("Doctor", "full_name", "Name of the doctor", "String", "Low"),
+            ("Appointment", "appointment_number", "Business ID for the encounter", "String", "Low"),
+            ("Appointment", "status", "Current state of the appointment workflow", "String", "Low"),
+            ("Expense", "expense_number", "Business ID for the expense claim", "String", "Low"),
+            ("Expense", "amount", "Monetary value of the claim", "Float", "Medium"),
+            ("AuditLog", "event", "Type of action performed", "String", "Low"),
+            ("AuditLog", "event_metadata", "Contextual details of the action", "JSON", "Medium"),
+            ("ResourceApplication", "application_number", "Business ID for the resource request", "String", "Low"),
+            ("CreditChange", "change_number", "Business ID for the credit line update", "String", "Low"),
+        ]
+        for entity, field, desc, ftype, sens in dictionary_data:
+            if not db.scalar(select(DataDictionaryEntry).where(DataDictionaryEntry.entity == entity, DataDictionaryEntry.field_name == field)):
+                db.add(DataDictionaryEntry(
+                    entity=entity, field_name=field, description=desc, 
+                    field_type=ftype, sensitivity=sens
+                ))
+        db.commit()
     finally:
-        db.close()
+        if should_close:
+            db.close()
 
 
 if __name__ == "__main__":
