@@ -44,3 +44,4 @@ phpunit.result.cache
 # Docker Databases
 **/mysql-data/
 **/docker-data/
+.gitignore

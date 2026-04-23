@@ -30,4 +30,3 @@ tests/repro_*.py
 # Celery
 celerybeat-schedule
 celerybeat.pid
-.gitignore
