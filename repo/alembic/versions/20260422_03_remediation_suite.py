@@ -16,7 +16,7 @@ depends_on = None
 
 
 def upgrade() -> None:
-    # 1. Create organization_invitations
+    # 1. Create organization_invitations (New table - normal create_table is fine)
     op.create_table(
         'organization_invitations',
         sa.Column('id', sa.Integer(), nullable=False),
@@ -38,37 +38,28 @@ def upgrade() -> None:
     op.create_index(op.f('ix_organization_invitations_org_id'), 'organization_invitations', ['org_id'], unique=False)
     op.create_index(op.f('ix_organization_invitations_token_hash'), 'organization_invitations', ['token_hash'], unique=True)
 
-    # 2. Update Patients (Secure Identifiers)
-    op.add_column('patients', sa.Column('patient_number_encrypted', sa.LargeBinary(), nullable=True))
-    op.add_column('patients', sa.Column('patient_number_hash', sa.String(length=128), nullable=True))
-    op.create_index(op.f('ix_patients_patient_number_hash'), 'patients', ['patient_number_hash'], unique=False)
-    
-    # In a real environment, we would backfill here.
-    # For this task, we assume fresh state or provide the columns for future use.
-    
-    # op.drop_index('uq_org_patient_num', table_name='patients')
-    # op.drop_column('patients', 'patient_number')
-    
-    # We allow nulls for now to avoid migration failure on non-empty tables without backfill,
-    # but the model enforces values.
-    op.create_unique_constraint('uq_org_patient_num', 'patients', ['org_id', 'patient_number_hash'])
+    # 2. Update Patients (Secure Identifiers) - Batch mode for SQLite compatibility
+    with op.batch_alter_table('patients', schema=None) as batch_op:
+        batch_op.add_column(sa.Column('patient_number_encrypted', sa.LargeBinary(), nullable=True))
+        batch_op.add_column(sa.Column('patient_number_hash', sa.String(length=128), nullable=True))
+        batch_op.create_index(op.f('ix_patients_patient_number_hash'), ['patient_number_hash'], unique=False)
+        batch_op.create_unique_constraint('uq_org_patient_num', ['org_id', 'patient_number_hash'])
 
-    # 3. Update Doctors (Secure Identifiers)
-    op.add_column('doctors', sa.Column('license_number_encrypted', sa.LargeBinary(), nullable=True))
-    op.add_column('doctors', sa.Column('license_number_hash', sa.String(length=128), nullable=True))
-    op.create_index(op.f('ix_doctors_license_number_hash'), 'doctors', ['license_number_hash'], unique=False)
-    
-    # op.drop_index('uq_org_license_num', table_name='doctors')
-    # op.drop_column('doctors', 'license_number')
-    op.create_unique_constraint('uq_org_license_num', 'doctors', ['org_id', 'license_number_hash'])
+    # 3. Update Doctors (Secure Identifiers) - Batch mode for SQLite compatibility
+    with op.batch_alter_table('doctors', schema=None) as batch_op:
+        batch_op.add_column(sa.Column('license_number_encrypted', sa.LargeBinary(), nullable=True))
+        batch_op.add_column(sa.Column('license_number_hash', sa.String(length=128), nullable=True))
+        batch_op.create_index(op.f('ix_doctors_license_number_hash'), ['license_number_hash'], unique=False)
+        batch_op.create_unique_constraint('uq_org_license_num', ['org_id', 'license_number_hash'])
 
-    # 4. Update Attachments (Business Traceability)
-    op.add_column('attachments', sa.Column('task_id', sa.Integer(), nullable=True))
-    op.add_column('attachments', sa.Column('process_instance_id', sa.Integer(), nullable=True))
-    op.create_foreign_key(op.f('fk_attachments_task_id_tasks'), 'attachments', 'tasks', ['task_id'], ['id'])
-    op.create_foreign_key(op.f('fk_attachments_process_instance_id_process_instances'), 'attachments', 'process_instances', ['process_instance_id'], ['id'])
-    op.create_index(op.f('ix_attachments_task_id'), 'attachments', ['task_id'], unique=False)
-    op.create_index(op.f('ix_attachments_process_instance_id'), 'attachments', ['process_instance_id'], unique=False)
+    # 4. Update Attachments (Business Traceability) - Batch mode for SQLite compatibility
+    with op.batch_alter_table('attachments', schema=None) as batch_op:
+        batch_op.add_column(sa.Column('task_id', sa.Integer(), nullable=True))
+        batch_op.add_column(sa.Column('process_instance_id', sa.Integer(), nullable=True))
+        batch_op.create_foreign_key(op.f('fk_attachments_task_id_tasks'), 'tasks', ['task_id'], ['id'])
+        batch_op.create_foreign_key(op.f('fk_attachments_process_instance_id_process_instances'), 'process_instances', ['process_instance_id'], ['id'])
+        batch_op.create_index(op.f('ix_attachments_task_id'), ['task_id'], unique=False)
+        batch_op.create_index(op.f('ix_attachments_process_instance_id'), ['process_instance_id'], unique=False)
 
 
 def downgrade() -> None:
