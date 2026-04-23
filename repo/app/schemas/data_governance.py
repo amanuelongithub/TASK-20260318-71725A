@@ -9,6 +9,7 @@ class CreateDataVersionRequest(BaseModel):
 
 class ValidateBatchRequest(BaseModel):
     batch_id: str
+    entity_type: str
     records: list[dict]
 
 

@@ -2,7 +2,7 @@ import pytest
 from datetime import datetime, timedelta
 from fastapi import status
 from sqlalchemy import select, update
-from app.models.entities import User, Organization, Role, RoleType, RolePermission, ProcessInstance, ProcessDefinition
+from app.models.entities import User, Organization, Role, RoleType, RolePermission, ProcessInstance, ProcessDefinition, OrganizationMembership
 
 @pytest.fixture
 def test_admin_user(db):
@@ -34,6 +34,12 @@ def test_admin_user(db):
     )
     db.add(user)
     db.flush()
+    
+    # NEW: Must create membership for login to work (Authorization Truth)
+    membership = OrganizationMembership(user_id=user.id, org_id=org.id, role_id=admin_role.id, is_active=True)
+    db.add(membership)
+    db.flush()
+    
     return user
 
 @pytest.fixture

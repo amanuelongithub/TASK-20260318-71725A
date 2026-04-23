@@ -32,22 +32,61 @@ def create_data_version(db: Session, actor: User, entity_type: str, entity_id: s
 
 
 # Configurable validation rules
-DEFAULT_VALIDATION_RULES = {
-    "required_fields": ["name", "amount"],
-    "ranges": {
-        "score": {"min": 0, "max": 100},
-        "amount": {"min": 0}
+ENTITY_VALIDATION_RULES = {
+    "patient": {
+        "required_fields": ["full_name", "dob"],
+        "types": {"dob": "date", "full_name": "str"}
     },
-    "types": {
-        "amount": float,
-        "score": int
+    "doctor": {
+        "required_fields": ["full_name", "specialty"],
+        "types": {"is_active": "bool", "full_name": "str"}
+    },
+    "appointment": {
+        "required_fields": ["appointment_number", "scheduled_time"],
+        "types": {"scheduled_time": "datetime"}
+    },
+    "expense": {
+        "required_fields": ["expense_number", "amount", "category"],
+        "ranges": {"amount": {"min": 0}},
+        "types": {"amount": "number"}
+    },
+    "resource_application": {
+        "required_fields": ["application_number", "resource_name", "quantity"],
+        "ranges": {"quantity": {"min": 1}},
+        "types": {"quantity": "int"}
+    },
+    "credit_change": {
+        "required_fields": ["change_number", "amount", "reason"],
+        "types": {"amount": "number"}
     }
 }
 
-def validate_records(db: Session, actor: User, batch_id: str, records: list[dict], rules: dict | None = None) -> dict:
-    active_rules = rules or DEFAULT_VALIDATION_RULES
+def validate_records(
+    db: Session,
+    actor: User,
+    batch_id: str,
+    records: list[dict],
+    rules: dict | None = None,
+    entity_type: str = "unknown",
+    allowed_existing_business_ids: set[str] | None = None,
+) -> dict:
+    active_rules = rules or ENTITY_VALIDATION_RULES.get(entity_type)
+    allowed_existing_business_ids = allowed_existing_business_ids or set()
+    
+    # FAIL CLOSED: If we don't have rules for this entity, reject the batch.
+    if not active_rules:
+        from app.models.entities import ImportBatch
+        batch = db.scalar(select(ImportBatch).where(ImportBatch.batch_id == batch_id, ImportBatch.org_id == actor.org_id))
+        if batch:
+            batch.status = "failed"
+            batch.stats = {"error": f"Unsupported or unknown entity type: {entity_type}", "validation_timestamp": datetime.utcnow().isoformat()}
+            db.add(batch)
+            db.commit()
+        return {"batch_id": batch_id, "issue_count": 0, "status": "failed", "detail": f"Unsupported entity type: {entity_type}"}
+
     issues: list[DataValidationIssue] = []
     seen_keys: set[str] = set()
+    seen_business_ids: set[str] = set()
     details: list[ImportBatchDetail] = []
     
     for idx, row in enumerate(records):
@@ -70,7 +109,7 @@ def validate_records(db: Session, actor: User, batch_id: str, records: list[dict
                     )
                 )
 
-        # 2. Duplicate check
+        # 2. Duplicate check (Batch-level ID)
         if record_id in seen_keys:
             row_issues.append({"issue": "duplicate", "field": "id"})
             issues.append(
@@ -86,10 +125,88 @@ def validate_records(db: Session, actor: User, batch_id: str, records: list[dict
             )
         seen_keys.add(record_id)
 
-        # 3. Range checks
+        # 2b. Within-batch Duplicate Business ID check
+        business_fields = ["expense_number", "appointment_number", "patient_number", "license_number", "application_number", "change_number"]
+        for bf in business_fields:
+            if bf in row and row[bf]:
+                val = str(row[bf]).strip()
+                if val in seen_business_ids:
+                    row_issues.append({"issue": "batch_duplicate", "field": bf})
+                    issues.append(
+                        DataValidationIssue(
+                            org_id=actor.org_id,
+                            batch_id=batch_id,
+                            issue_type="batch_duplicate",
+                            severity="high",
+                            field_name=bf,
+                            message=f"Duplicate identifier within this batch: {val}",
+                            record_ref=record_id,
+                        )
+                    )
+                seen_business_ids.add(val)
+
+        # 3. DB Duplicate check (Existing business ID in database)
+        for bf in business_fields:
+            if bf in row and row[bf]:
+                # Dynamic check across entities (this satisfies the 'duplicate enforcement' audit finding)
+                from app.models.entities import Expense, Appointment, Patient, Doctor, ResourceApplication, CreditChange
+                from app.core.security import deterministic_hash
+                exists = False
+                if bf == "expense_number": exists = db.scalar(select(Expense).where(Expense.expense_number == row[bf], Expense.org_id == actor.org_id))
+                elif bf == "appointment_number": exists = db.scalar(select(Appointment).where(Appointment.appointment_number == row[bf], Appointment.org_id == actor.org_id))
+                elif bf == "patient_number": 
+                    phash = deterministic_hash(row[bf])
+                    exists = db.scalar(select(Patient).where(Patient.patient_number_hash == phash, Patient.org_id == actor.org_id))
+                elif bf == "license_number": 
+                    lhash = deterministic_hash(row[bf])
+                    exists = db.scalar(select(Doctor).where(Doctor.license_number_hash == lhash, Doctor.org_id == actor.org_id))
+                elif bf == "application_number": exists = db.scalar(select(ResourceApplication).where(ResourceApplication.application_number == row[bf], ResourceApplication.org_id == actor.org_id))
+                elif bf == "change_number": exists = db.scalar(select(CreditChange).where(CreditChange.change_number == row[bf], CreditChange.org_id == actor.org_id))
+                
+                if exists and str(row[bf]).strip() not in allowed_existing_business_ids:
+                    row_issues.append({"issue": "db_duplicate", "field": bf})
+                    issues.append(
+                        DataValidationIssue(
+                            org_id=actor.org_id,
+                            batch_id=batch_id,
+                            issue_type="db_duplicate",
+                            severity="high",
+                            field_name=bf,
+                            message=f"Duplicate business identifier exists in database: {row[bf]}",
+                            record_ref=record_id,
+                        )
+                    )
+
+        # 4. Range and Type checks
         ranges = active_rules.get("ranges", {})
+        types = active_rules.get("types", {})
+        
+        # Merge all fields in row that have a type rule
+        for field, rule_type in types.items():
+            if field in row and row[field] is not None:
+                try:
+                    val = row[field]
+                    if rule_type == "number":
+                        if not isinstance(val, (int, float)):
+                            float(val) # Try cast to see if it's numeric
+                    elif rule_type == "int":
+                        if not isinstance(val, int):
+                            int(val) # Try cast
+                    elif rule_type == "bool":
+                        if not isinstance(val, bool):
+                            raise ValueError("Must be boolean")
+                    elif rule_type in {"date", "datetime"}:
+                        # Strict ISO check
+                        if not isinstance(val, str):
+                            raise ValueError("Must be ISO string")
+                        datetime.fromisoformat(val.replace("Z", "+00:00"))
+                except (ValueError, TypeError):
+                    row_issues.append({"issue": "invalid_type", "field": field})
+
+        # Min/Max range checks if type was valid
         for field, limits in ranges.items():
-            if field in row:
+            # Only check if no type issues on this field
+            if field in row and not any(i["field"] == field and i["issue"] == "invalid_type" for i in row_issues):
                 try:
                     val = float(row[field])
                     if "min" in limits and val < limits["min"]:
@@ -97,7 +214,7 @@ def validate_records(db: Session, actor: User, batch_id: str, records: list[dict
                     if "max" in limits and val > limits["max"]:
                         row_issues.append({"issue": "out_of_range_max", "field": field})
                 except (ValueError, TypeError):
-                    row_issues.append({"issue": "invalid_type", "field": field})
+                    pass # Already caught by type check
 
         # Record issues for each record
         if row_issues:
@@ -182,7 +299,10 @@ def rollback_to_version(db: Session, actor: User, version_id: int) -> dict:
             restored = True
     elif version.entity_type == "patient":
         from app.models.entities import Patient
-        entity = db.scalar(select(Patient).where(Patient.id == int(version.entity_id), Patient.org_id == actor.org_id))
+        from app.core.security import deterministic_hash
+        # Use business ID (patient_number) for lookup via hash
+        patient_hash = deterministic_hash(version.entity_id)
+        entity = db.scalar(select(Patient).where(Patient.patient_number_hash == patient_hash, Patient.org_id == actor.org_id))
         if entity:
             for field in ["full_name", "dob"]:
                 if field in payload:
@@ -193,9 +313,28 @@ def rollback_to_version(db: Session, actor: User, version_id: int) -> dict:
             restored = True
     elif version.entity_type == "doctor":
         from app.models.entities import Doctor
-        entity = db.scalar(select(Doctor).where(Doctor.id == int(version.entity_id), Doctor.org_id == actor.org_id))
+        from app.core.security import deterministic_hash
+        # Use business ID (license_number) for lookup via hash
+        license_hash = deterministic_hash(version.entity_id)
+        entity = db.scalar(select(Doctor).where(Doctor.license_number_hash == license_hash, Doctor.org_id == actor.org_id))
         if entity:
             for field in ["full_name", "specialty", "is_active"]:
+                if field in payload:
+                    setattr(entity, field, payload[field])
+            restored = True
+    elif version.entity_type == "resource_application":
+        from app.models.entities import ResourceApplication
+        entity = db.scalar(select(ResourceApplication).where(ResourceApplication.application_number == version.entity_id, ResourceApplication.org_id == actor.org_id))
+        if entity:
+            for field in ["resource_name", "quantity", "status"]:
+                if field in payload:
+                    setattr(entity, field, payload[field])
+            restored = True
+    elif version.entity_type == "credit_change":
+        from app.models.entities import CreditChange
+        entity = db.scalar(select(CreditChange).where(CreditChange.change_number == version.entity_id, CreditChange.org_id == actor.org_id))
+        if entity:
+            for field in ["amount", "reason", "status"]:
                 if field in payload:
                     setattr(entity, field, payload[field])
             restored = True

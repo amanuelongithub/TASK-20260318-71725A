@@ -34,6 +34,43 @@ class OrganizationMembership(Base):
     joined_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
     
     role = relationship("Role")
+    user = relationship("User", back_populates="memberships")
+
+    @staticmethod
+    def is_user_active_in_org(session, user_id: int, org_id: int) -> bool:
+        from sqlalchemy import select
+        return session.scalar(
+            select(OrganizationMembership.is_active)
+            .where(
+                OrganizationMembership.user_id == user_id,
+                OrganizationMembership.org_id == org_id
+            )
+        ) or False
+
+    @staticmethod
+    def count_active_users_in_org(session, org_id: int) -> int:
+        from sqlalchemy import func, select
+        return session.scalar(
+            select(func.count(OrganizationMembership.id))
+            .where(
+                OrganizationMembership.org_id == org_id,
+                OrganizationMembership.is_active == True
+            )
+        ) or 0
+
+    @staticmethod
+    def resolve_users_by_role_in_org(session, org_id: int, role_name: RoleType) -> list[int]:
+        from sqlalchemy import select
+        return session.scalars(
+            select(OrganizationMembership.user_id)
+            .join(Role)
+            .where(
+                OrganizationMembership.org_id == org_id,
+                OrganizationMembership.is_active == True,
+                Role.name == role_name
+            )
+        ).all()
+
 
 
 
@@ -68,10 +105,12 @@ class User(Base):
     failed_login_attempts: Mapped[int] = mapped_column(Integer, default=0)
     last_failed_login: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     locked_until: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
-    reset_token: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    reset_token_hash: Mapped[str | None] = mapped_column(String(128), nullable=True)
     reset_token_expires: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
     role = relationship("Role")
+    memberships = relationship("OrganizationMembership", back_populates="user", cascade="all, delete-orphan")
+
 
 
 class ProcessDefinition(Base):
@@ -313,6 +352,21 @@ class Patient(Base):
         from app.core.security import encrypt_field, deterministic_hash
         self.patient_number_encrypted = encrypt_field(value)
         self.patient_number_hash = deterministic_hash(value)
+
+    @property
+    def phone_number(self) -> str | None:
+        if not self.phone_number_encrypted:
+            return None
+        from app.core.security import decrypt_field
+        return decrypt_field(self.phone_number_encrypted)
+
+    @phone_number.setter
+    def phone_number(self, value: str | None):
+        if value is None:
+            self.phone_number_encrypted = None
+            return
+        from app.core.security import encrypt_field
+        self.phone_number_encrypted = encrypt_field(value)
 
 
 class Doctor(Base):

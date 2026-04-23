@@ -115,7 +115,7 @@ def test_attachment_initiator_access(client, db, setup_hospital_org):
     assert resp.status_code == 200
     
     # 2. Upload attachment linked to RES-OWNERSHIP
-    files = {"upload": ("sample.pdf", b"test pdf content", "application/pdf")}
+    files = {"upload": ("sample.pdf", b"%PDF-1.4\n%test content", "application/pdf")}
     data = {"business_owner_id": "RES-OWNERSHIP"}
     resp = client.post("/api/files/upload", files=files, data=data, headers=headers)
     assert resp.status_code == 200

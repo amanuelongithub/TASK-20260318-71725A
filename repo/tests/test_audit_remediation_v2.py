@@ -43,6 +43,8 @@ def test_user(db):
         )
         db.add(user)
         db.flush()
+        from app.models.entities import OrganizationMembership
+        db.add(OrganizationMembership(user_id=user.id, org_id=org.id, role_id=admin_role.id, is_active=True))
     
     db.commit()
     return user
@@ -99,7 +101,7 @@ def test_advanced_metrics(client, test_user):
     response = client.get("/api/metrics/reports/advanced", headers=headers)
     assert response.status_code == 200
     data = response.json()
-    assert "sla_compliance_rate" in data
+    assert "work_order_sla" in data
     assert "activity_24h" in data
 
 def test_response_desensitization_me(client, test_user):

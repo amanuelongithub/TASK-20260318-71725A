@@ -16,9 +16,12 @@ depends_on = None
 
 
 def upgrade() -> None:
-    # 1. Remove unique constraint uq_org_idempotency
-    # PostgreSQL often requires dropping the constraint by name.
-    op.drop_constraint('uq_org_idempotency', 'process_instances', type_='unique')
+    if op.get_bind().dialect.name != 'sqlite':
+        # Use IF EXISTS — on a fresh DB this constraint may not exist if the
+        # earlier migration that created it was never applied.
+        op.execute(
+            "ALTER TABLE process_instances DROP CONSTRAINT IF EXISTS uq_org_idempotency"
+        )
 
     # 2. Add indexes for ProcessInstance
     op.create_index(op.f('ix_process_instances_created_at'), 'process_instances', ['created_at'], unique=False)

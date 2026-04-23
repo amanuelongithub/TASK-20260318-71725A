@@ -4,6 +4,8 @@ from app.models.entities import Organization, User, Role, RoleType, ProcessInsta
 from app.core.security import create_access_token
 
 def test_tenant_isolation_hospital_data(client, db):
+    from app.db.init_db import init_db
+    init_db(db)
     # Setup two organizations
     org1 = Organization(org_code="T1", name="Tenant 1")
     org2 = Organization(org_code="T2", name="Tenant 2")
@@ -19,6 +21,13 @@ def test_tenant_isolation_hospital_data(client, db):
     u1 = User(username="admin_t1", hashed_password="...", org_id=org1.id, role_id=role.id, is_active=True)
     u2 = User(username="admin_t2", hashed_password="...", org_id=org2.id, role_id=role.id, is_active=True)
     db.add_all([u1, u2])
+    db.flush()
+    
+    from app.models.entities import OrganizationMembership
+    db.add_all([
+        OrganizationMembership(user_id=u1.id, org_id=org1.id, role_id=role.id),
+        OrganizationMembership(user_id=u2.id, org_id=org2.id, role_id=role.id),
+    ])
     db.flush()
     
     # Org 1 data
@@ -41,6 +50,8 @@ def test_tenant_isolation_hospital_data(client, db):
     assert "EXP-T2" not in [e["expense_number"] for e in data]
 
 def test_rbac_auditor_read_only(client, db):
+    from app.db.init_db import init_db
+    init_db(db)
     org = Organization(org_code="AUDIT_ORG", name="Audit Org")
     db.add(org)
     db.flush()
@@ -53,6 +64,9 @@ def test_rbac_auditor_read_only(client, db):
         
     auditor = User(username="auditor1", hashed_password="...", org_id=org.id, role_id=auditor_role.id, is_active=True)
     db.add(auditor)
+    db.flush()
+    from app.models.entities import OrganizationMembership
+    db.add(OrganizationMembership(user_id=auditor.id, org_id=org.id, role_id=auditor_role.id))
     db.commit()
     
     token = create_access_token(subject=str(auditor.id), org_id=org.id, roles=["auditor"])
@@ -68,6 +82,8 @@ def test_rbac_auditor_read_only(client, db):
     assert response_write.status_code == 403
 
 def test_workflow_full_chain_writeback(client, db):
+    from app.db.init_db import init_db
+    init_db(db)
     from datetime import datetime
     org = Organization(org_code="WORKFLOW_ORG", name="Workflow Org")
     db.add(org)
@@ -76,6 +92,9 @@ def test_workflow_full_chain_writeback(client, db):
     admin_role = db.scalar(select(Role).where(Role.name == RoleType.ADMIN))
     admin = User(username="workflow_admin", hashed_password="...", org_id=org.id, role_id=admin_role.id, is_active=True)
     db.add(admin)
+    db.flush()
+    from app.models.entities import OrganizationMembership
+    db.add(OrganizationMembership(user_id=admin.id, org_id=org.id, role_id=admin_role.id))
     db.flush()
     
     # Create an expense to be approved

@@ -17,33 +17,50 @@ Expanded implementation baseline for your full plan.
 - Alembic setup with multi-phase remediation migrations
 - Docker compose for hardened production-ready deployment
 
-## Security & Audit Compliance (Pass Criteria)
+## Security & Audit Compliance (Remediated & Verified)
 
 | Audit Goal | Implementation Detail | Verification Path |
 |:---|:---|:---|
-| **Hospital API Validity** | `Patient`/`Doctor` models use `@property` to align encrypted fields with Pydantic schemas. | `app/models/entities.py:291,308` |
-| **Metrics Logic Fix** | `ProcessInstance.completed_at` tracks duration; aggregate jobs use it for velocity metrics. | `app/tasks/jobs.py:92`, `app/models/entities.py:111` |
-| **HTTPS Default Posture** | `ALLOW_PLAIN_HTTP=False` in `config.py` and `.env`; enforced by middleware. | `app/main.py:27`, `app/core/config.py:19` |
-| **Full-Chain Workflow** | Expense/Appointment workflows have specialized writeback logic & business timestamps. | `app/services/process_service.py:11-46` |
-| **Async Deployment** | Celery `worker` and `beat` services integrated into the container stack. | `docker-compose.yml:25,35` |
-| **Tenant Isolation** | All business logic (workflow, hospital, files) is partitioned by `org_id`. | `tests/test_security_audit.py:6` |
-| **RBAC Integrity** | Multi-role permission matrix enforced by `require_permission` middleware. | `tests/test_security_audit.py:46` |
-| **Data Dictionary** | Persistent, governed metadata stored in `data_dictionary_entries` table. | `app/services/dictionary_service.py:6` |
+| **Alembic Integrity** | Disconnected branches merged into single head `20260422_09`. | `alembic heads` |
+| **Tenant Membership** | Authorization truth moved to `OrganizationMembership`; `User.org_id` denotes home org only. | `app/services/auth_service.py` |
+| **HTTPS Enforcement** | Strict HTTPS middleware; plain HTTP requests are rejected in every environment unless already TLS-terminated and forwarded as HTTPS. | `app/main.py:22` |
+| **Invitation Security** | Invitation tokens strictly bound to registrant `username` or `email` identity. | `app/services/auth_service.py:45` |
+| **File Hardening** | Magic-number content signature validation (PDF, PNG, JPEG, JSON). | `app/services/storage_service.py` |
+| **Audit Traceability** | ID persistence (flush) guaranteed before audit log generation. | `app/services/storage_service.py` |
+| **Secret Protection** | Committed TLS keys removed; `.gitignore` hardened for secrets/certs. | `.gitignore` |
 
-## Run locally
+## Hardened Deployment
+1. Generate unique production certificates:
+   ```bash
+   python scripts/generate_certs.py
+   ```
+   (Outputs `server.crt` and `server.key` to `deploy/certs/`)
+2. Start the full hardened stack:
+   ```bash
+   docker-compose up -d
+   ```
+   (Stacks Nginx with TLS termination and enforced 301 redirects)
+
+## Run locally (Development)
 1. Copy `.env.example` to `.env`
-2. Install dependencies: `pip install -r requirements.txt`
+2. Install dependencies:
+   ```bash
+   pip install -r requirements.txt
+   ```
 3. Start backing services: `docker-compose up -d db redis`
 4. Apply migrations: `PYTHONPATH=. alembic upgrade head`
 5. Seed initial data (RBAC, Dictionary): `python -m app.db.init_db`
-6. Run API: `uvicorn app.main:app --reload`
-7. (Optional) Start workers: `PYTHONPATH=. celery -A app.tasks.worker worker --loglevel=info`
+6. Run the API behind TLS:
+   ```bash
+   python scripts/generate_certs.py
+   uvicorn app.main:app --host 0.0.0.0 --port 8000 --ssl-certfile deploy/certs/server.crt --ssl-keyfile deploy/certs/server.key
+   ```
+   Alternatively, proxy local traffic through the included Nginx TLS terminator.
 
 ## Metrics Semantics
 - **Work Order SLA**: % of tasks completed before their `sla_due_at`.
-- **Message Reach**: % of unique organization users who performed an action or were mentioned in an audit log in the last 24h.
-- **Attendance Anomalies**: Ratio of overdue pending tasks per active user.
-- **Activity Index**: Raw count of system events (AuditLog) in the last 24h.
+- **Message Reach**: % of unique organization users (membership-based) who performed an action.
+- **Attendance Anomalies**: Ratio of overdue pending tasks per active member count.
 
 ## Verification Suite
 Run the full validation suite to ensure audit compliance:
@@ -51,11 +68,14 @@ Run the full validation suite to ensure audit compliance:
 pytest
 ```
 Individual critical tests:
-- `tests/test_audit_remediation.py` (Idempotency, Identity, HTTPS)
-- `tests/test_export_integration.py` (Export Lifecycle)
-- `tests/test_security_audit.py` (Tenant Isolation, RBAC)
+- `tests/test_audit_remediation.py` (Tenant Membership, HTTPS, Magic Numbers, Lockout)
+- `tests/test_data_governance.py` (Rollback for 6 entities, Fail-Closed Validation)
+- `tests/test_idempotency_concurrency.py` (Persistence-layer 24h triggers)
+- `tests/test_health.py` (HTTPS-only health check)
+
+The test suite bootstraps a temporary SQLite schema from the current models and installs SQLite parity triggers for persistence-level safeguards such as the 24-hour idempotency rule.
 
 ## Operational Reliability
-- **Idempotency**: 24-hour window enforced at the service layer for `idempotency_key` and `business_id`.
-- **Multi-Tenant Identity**: User identity is global; organizational context (org/role) is resolved via JWT-bound memberships without mutating the base record.
-- **Performance**: Standardized indexing on all time-queried fields (`created_at`, `completed_at`, `sla_due_at`).
+- **Idempotency**: 24-hour window enforced at the service layer AND persistence layer via DB triggers.
+- **Membership Identity**: Global users with context-bound memberships.
+- **Lockout Policy**: 5 failed attempts in 10 minutes results in a 30-minute account lockout.

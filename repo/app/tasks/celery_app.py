@@ -3,6 +3,8 @@ from celery import Celery
 from app.core.config import settings
 
 celery_app = Celery("medical_ops", broker=settings.redis_url, backend=settings.redis_url)
+# Import jobs to register tasks
+from . import jobs # noqa: F401
 celery_app.conf.beat_schedule = {
     "daily-metrics": {
         "task": "jobs.aggregate_all_daily_metrics",

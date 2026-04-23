@@ -1,6 +1,9 @@
 from typing import Any
 from datetime import datetime, timedelta
+import logging
 import json
+
+logger = logging.getLogger(__name__)
 
 from fastapi import HTTPException
 from sqlalchemy import and_, func, select
@@ -164,10 +167,10 @@ def _resolve_assignees(db: Session, org_id: int, initiator_id: int, raw_assignee
                 role_enum = RoleType(role_name)
             except ValueError:
                 role_enum = None
-            role = db.scalar(select(Role).where(Role.name == role_enum)) if role_enum else None
-            if role:
-                users = db.scalars(select(User).where(User.org_id == org_id, User.role_id == role.id, User.is_active.is_(True))).all()
-                resolved.extend([u.id for u in users])
+            if role_enum:
+                from app.models.entities import OrganizationMembership
+                user_ids = OrganizationMembership.resolve_users_by_role_in_org(db, org_id, role_enum)
+                resolved.extend(user_ids)
     return list(dict.fromkeys(resolved)) or [initiator_id]
 
 
@@ -257,26 +260,48 @@ def start_process(
         variables=variables or {},
         sla_due_at=now + timedelta(hours=48), # Global SLA aligned to prompt
     )
-    db.add(instance)
-    db.flush() # Ensure instance.id is populated for child Task records
-    # The unique constraint on idempotency_key has been removed from the DB to support the 24-hour rule.
-    # We now rely on the explicit window check above.
-    raw_assignees = defn_dict.get("assignees", {}).get(first_node, [actor.id])
-    assignees = _resolve_assignees(db, actor.org_id, actor.id, raw_assignees)
-    due = now + timedelta(hours=timeout_hours)
-    for assignee_id in assignees:
-        db.add(
-            Task(
-                org_id=actor.org_id,
-                process_instance_id=instance.id,
-                assignee_id=int(assignee_id),
-                node_key=first_node,
-                status=TaskStatus.PENDING,
-                sla_due_at=due,
+    
+    try:
+        db.add(instance)
+        db.flush() # CRITICAL: Triggers may fire here or on commit
+        
+        raw_assignees = defn_dict.get("assignees", {}).get(first_node, [actor.id])
+        assignees = _resolve_assignees(db, actor.org_id, actor.id, raw_assignees)
+        due = now + timedelta(hours=timeout_hours)
+        for assignee_id in assignees:
+            db.add(
+                Task(
+                    org_id=actor.org_id,
+                    process_instance_id=instance.id,
+                    assignee_id=int(assignee_id),
+                    node_key=first_node,
+                    status=TaskStatus.PENDING,
+                    sla_due_at=due,
+                )
             )
+        log_event(db, actor.org_id, actor.id, "process.started", {"instance_id": instance.id, "node": first_node, "assignees": assignees})
+        db.commit()
+    except Exception as e:
+        db.rollback()
+        # Potential race condition: someone else inserted it between our check and our flush/commit
+        # OR the persistence-layer trigger was hit.
+        # Fall back to returning the existing instance to satisfy the idempotency rule.
+        logger.warning(f"Process start conflict detected (likely concurrency). Attempting to resolve via re-fetch: {str(e)}")
+        existing_again = db.scalar(
+            select(ProcessInstance).where(
+                and_(
+                    ProcessInstance.org_id == actor.org_id,
+                    ((ProcessInstance.idempotency_key == idempotency_key) | 
+                     (ProcessInstance.business_id == business_id)),
+                    ProcessInstance.created_at >= day_ago
+                )
+            ).order_by(ProcessInstance.created_at.desc())
         )
-    log_event(db, actor.org_id, actor.id, "process.started", {"instance_id": instance.id, "node": first_node, "assignees": assignees})
-    db.commit()
+        if existing_again:
+            return existing_again
+        # If we still can't find it, it might be a different error (e.g. FK violation, but unlikely here)
+        raise e
+
     db.refresh(instance)
     return instance
 
@@ -351,6 +376,9 @@ def complete_task(db: Session, actor: User, task_id: int, decision: str, comment
             sibling.completed_at = datetime.utcnow()
 
         next_nodes = _resolve_next_nodes(defn_dict, task.node_key, normalized, instance.variables)
+        # Ensure we don't treat terminal states as actual nodes to spawn tasks for
+        next_nodes = [n for n in next_nodes if n not in {"completed", "rejected"}]
+        
         if next_nodes:
             instance.current_node = ",".join(next_nodes)
             assignees_map = defn_dict.get("assignees", {})

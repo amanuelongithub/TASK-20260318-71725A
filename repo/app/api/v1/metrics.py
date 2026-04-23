@@ -70,7 +70,8 @@ def get_advanced_report(
     expense_total = db.scalar(select(func.sum(Expense.amount)).where(Expense.org_id == actor.org_id)) or 0.0
     
     # 5. Message Reach
-    total_org_users = db.scalar(select(func.count(User.id)).where(User.org_id == actor.org_id, User.is_active == True)) or 1
+    from app.models.entities import OrganizationMembership
+    total_org_users = OrganizationMembership.count_active_users_in_org(db, actor.org_id) or 1
     touched_users = db.scalar(select(func.count(func.distinct(AuditLog.actor_id))).where(AuditLog.org_id == actor.org_id, AuditLog.created_at >= day_ago)) or 0
     message_reach = touched_users / total_org_users if total_org_users > 0 else 0.0
 

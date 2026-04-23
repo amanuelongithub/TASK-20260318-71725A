@@ -12,3 +12,5 @@ redis
 httpx
 cryptography
 openpyxl
+pytest
+pytest-asyncio

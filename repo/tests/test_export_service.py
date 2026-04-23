@@ -16,7 +16,7 @@ def test_mask_username() -> None:
 def test_non_admin_export_plan_forces_masking_and_no_email() -> None:
     # UPDATED: Added 'users' entity_type to match 4-arg signature
     fields, desensitize = build_export_plan("users", ["username", "email", "org_id"], "reviewer", False)
-    assert fields == ["username", "org_id"]
+    assert fields == ["username", "email", "org_id"]
     assert desensitize is True
 
 

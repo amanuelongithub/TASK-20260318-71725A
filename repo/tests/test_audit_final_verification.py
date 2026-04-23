@@ -1,6 +1,6 @@
 import pytest
 from sqlalchemy import select, inspect
-from app.models.entities import ProcessDefinition, MetricsSnapshot, Organization, User, Role, RoleType, OrganizationMembership, Task, ResourceApplication, CreditChange, RolePermission, ProcessInstance, ProcessStatus
+from app.models.entities import ProcessDefinition, MetricsSnapshot, Organization, User, Role, RoleType, OrganizationMembership, Task, ResourceApplication, CreditChange, RolePermission, ProcessInstance, ProcessStatus, TaskStatus
 from app.tasks.jobs import aggregate_daily_metrics
 from app.db.init_db import init_db
 from app.core.security import create_access_token
@@ -156,15 +156,23 @@ def test_index_and_constraint_validation(db):
         has_org_id_uq = "org_id" in all_cols
         assert has_business_num_uq and has_org_id_uq, f"Missing unique constraint on business number/org_id for {table_name}"
 
-def test_https_enforcement_regression(client):
-    # This should succeed now because conftest.py adds the header
-    response = client.get("/health")
-    assert response.status_code == 200
+def test_https_enforcement_regression(monkeypatch):
+    from app.core.config import settings
+    monkeypatch.setattr(settings, "allow_plain_http", False)
+    
+    # Use a fresh client without the X-Forwarded-Proto header from the fixture
+    from fastapi.testclient import TestClient
+    from app.main import app
+    with TestClient(app) as c:
+        # This should fail now without the exemption and without the bypass
+        response = c.get("/health")
+        assert response.status_code == 403
     
     # Sanity check: if we explicitly pass a different scheme, it should still fail or be handled
     from fastapi.testclient import TestClient
     from app.main import app
     with TestClient(app) as c:
+        monkeypatch.setattr(settings, "allow_plain_http", False)
         resp = c.get("/health")
         # Middleware checks x-forwarded-proto first. If missing, it checks request.url.scheme.
         # TestClient defaults to http.

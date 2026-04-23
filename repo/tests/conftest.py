@@ -1,6 +1,7 @@
 import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine
+from sqlalchemy import text
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 from unittest.mock import patch
@@ -23,14 +24,32 @@ engine = create_engine(
 )
 TestingSessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
+
+def _install_sqlite_test_triggers() -> None:
+    with engine.begin() as conn:
+        conn.execute(text("""
+            CREATE TRIGGER IF NOT EXISTS validate_process_idempotency_sqlite_24h
+            BEFORE INSERT ON process_instances
+            FOR EACH ROW
+            BEGIN
+                SELECT RAISE(ABORT, 'Persistence-layer violation: Duplicate business_id or idempotency_key within 24-hour window')
+                WHERE EXISTS (
+                    SELECT 1 FROM process_instances
+                    WHERE org_id = NEW.org_id
+                      AND (business_id = NEW.business_id OR idempotency_key = NEW.idempotency_key)
+                      AND created_at >= datetime('now', '-24 hours')
+                );
+            END;
+        """))
+
 @pytest.fixture(scope="session", autouse=True)
 def setup_db():
-    # Globally patch SessionLocal and engine to point to our test DB
+    Base.metadata.create_all(bind=engine)
+    _install_sqlite_test_triggers()
+
     with patch("app.db.session.engine", engine), \
          patch("app.db.session.SessionLocal", TestingSessionLocal):
-        Base.metadata.create_all(bind=engine)
         yield
-        Base.metadata.drop_all(bind=engine)
     
     # Disposal is required to release the file handle on Windows
     engine.dispose()
@@ -46,15 +65,17 @@ def setup_db():
 @pytest.fixture
 def db():
     session = TestingSessionLocal()
-    yield session
-    session.close()
-    # Explicitly clear all data between tests for isolation
-    for table in reversed(Base.metadata.sorted_tables):
-        session.execute(table.delete())
-    session.commit()
+    try:
+        yield session
+    finally:
+        session.rollback()
+        for table in reversed(Base.metadata.sorted_tables):
+            session.execute(table.delete())
+        session.commit()
+        session.close()
 
 @pytest.fixture
-def client(db):
+def https_client(db):
     def override_get_db():
         try:
             yield db
@@ -62,7 +83,25 @@ def client(db):
             pass
     
     app.dependency_overrides[get_db] = override_get_db
-    # Compliance: Middleware requires HTTPS. We provide the header to simulate an SSL-terminating proxy.
     with TestClient(app, headers={"X-Forwarded-Proto": "https"}) as c:
         yield c
     app.dependency_overrides.clear()
+
+
+@pytest.fixture
+def http_client(db):
+    def override_get_db():
+        try:
+            yield db
+        finally:
+            pass
+
+    app.dependency_overrides[get_db] = override_get_db
+    with TestClient(app) as c:
+        yield c
+    app.dependency_overrides.clear()
+
+
+@pytest.fixture
+def client(https_client):
+    yield https_client

@@ -16,14 +16,14 @@ def setup_data(db: Session):
     if not admin_role:
         admin_role = Role(name=RoleType.ADMIN)
         db.add(admin_role)
-        db.commit()
+        db.flush()
     
     # Ensure org exists
     org = db.scalar(select(Organization).where(Organization.org_code == "test_org"))
     if not org:
         org = Organization(org_code="test_org", name="Test Org")
         db.add(org)
-        db.commit()
+        db.flush()
         db.refresh(org)
     
     # Ensure user exists
@@ -37,8 +37,11 @@ def setup_data(db: Session):
             is_active=True
         )
         db.add(user)
-        db.commit()
+        db.flush()
         db.refresh(user)
+        from app.models.entities import OrganizationMembership
+        db.add(OrganizationMembership(user_id=user.id, org_id=org.id, role_id=admin_role.id, is_active=True))
+        db.flush()
     
     return org, user
 
@@ -60,10 +63,10 @@ def test_process_export_job_lifecycle_completed(db: Session, setup_data, tmp_pat
     
     # 2. Run the task
     with patch("app.tasks.jobs.settings") as mock_settings:
-        # Standardize test DB usage for the background task as well by patching SessionLocal in jobs.py
         with patch("app.tasks.jobs.SessionLocal", return_value=db):
-            mock_settings.file_storage_path = str(tmp_path)
-            process_export_job.apply(args=[job_id])
+            with patch.object(db, "close", MagicMock()): 
+                mock_settings.file_storage_path = str(tmp_path)
+                process_export_job.apply(args=[job_id])
     
     # 3. Verify status and audit log
     db.expire_all()
@@ -97,11 +100,12 @@ def test_process_export_job_lifecycle_failed(db: Session, setup_data):
     
     # 2. Run the task
     with patch("app.tasks.jobs.SessionLocal", return_value=db):
-        with patch("app.tasks.jobs.generate_export_csv", side_effect=Exception("Simulated failure")):
-            try:
-                process_export_job.apply(args=[job_id])
-            except Exception:
-                pass
+        with patch.object(db, "close", MagicMock()):
+            with patch("app.services.export_service.generate_export_csv", side_effect=Exception("Simulated failure")):
+                try:
+                    process_export_job.apply(args=[job_id])
+                except Exception:
+                    pass
             
     # 3. Verify status and audit log
     db.expire_all()
@@ -114,4 +118,4 @@ def test_process_export_job_lifecycle_failed(db: Session, setup_data):
     )
     assert audit is not None
     assert audit.event_metadata["job_id"] == job_id
-    assert "Simulated failure" in audit.event_metadata["error"]
+    assert "Export generation failed due to an internal error." in audit.event_metadata["error"]

@@ -111,11 +111,11 @@ def aggregate_daily_metrics(org_id: int, db: Session | None = None) -> int:
 
         # 5. Message Reach (%)
         # Ratio of unique users touched by a system event (task/log) vs total users
-        from app.models.entities import AuditLog, User
+        from app.models.entities import AuditLog, OrganizationMembership
         unique_touched_users = db.scalar(select(func.count(func.distinct(AuditLog.actor_id))).where(
             AuditLog.org_id == org_id, AuditLog.created_at >= yesterday, AuditLog.actor_id.isnot(None)
         )) or 0
-        total_org_users = db.scalar(select(func.count(User.id)).where(User.org_id == org_id, User.is_active == True)) or 1
+        total_org_users = OrganizationMembership.count_active_users_in_org(db, org_id) or 1
         message_reach = float(unique_touched_users) / total_org_users if total_org_users > 0 else 0.0
 
         # 6. Activity Count
@@ -203,7 +203,7 @@ def process_export_job(self, job_id: int) -> int:
         export_format = str(job.fields.get("format", "csv")).lower()
         extension = "xlsx" if export_format == "xlsx" else "csv"
         output_path = output_dir / f"export_job_{job.id}.{extension}"
-        columns = job.fields.get("columns", [])
+        columns = job.fields.get("columns") or []
         desensitize = bool(job.fields.get("desensitize", True))
         entity_type = str(job.fields.get("entity_type", "users"))
         
@@ -290,20 +290,17 @@ def escalate_overdue_tasks() -> int:
             select(Task).where(Task.status == TaskStatus.PENDING, Task.sla_due_at.is_not(None), Task.sla_due_at < now)
         ).all()
         for task in rows:
-            admin_role = db.scalar(select(Role).where(Role.name == RoleType.ADMIN))
-            admin_user = (
-                db.scalar(select(User).where(User.org_id == task.org_id, User.role_id == admin_role.id, User.is_active.is_(True)))
-                if admin_role
-                else None
-            )
-            if admin_user:
-                task.assignee_id = admin_user.id
+            from app.models.entities import OrganizationMembership
+            admins = OrganizationMembership.resolve_users_by_role_in_org(db, task.org_id, RoleType.ADMIN)
+            admin_user_id = admins[0] if admins else None
+            if admin_user_id:
+                task.assignee_id = admin_user_id
             db.add(
                 AuditLog(
                     org_id=task.org_id,
                     actor_id=None,
                     event="task.escalated",
-                    event_metadata={"task_id": task.id, "assignee_id": task.assignee_id, "reassigned_to_admin": bool(admin_user)},
+                    event_metadata={"task_id": task.id, "assignee_id": task.assignee_id, "reassigned_to_admin": bool(admin_user_id)},
                 )
             )
         db.commit()
@@ -322,25 +319,44 @@ def escalate_overdue_tasks() -> int:
 )
 def prune_old_backups() -> int:
     backup_dir = Path("backups")
+    archive_dir = Path("archives")
     if not backup_dir.exists():
         return 0
+    archive_dir.mkdir(parents=True, exist_ok=True)
     
     count = 0
     now = datetime.utcnow()
     retention_limit = now - timedelta(days=30)
+    purge_limit = now - timedelta(days=60)
     
+    # 1. Move old backups to archive
     for f in backup_dir.glob("medical_ops_*.sql"):
         try:
             ts_str = f.stem.replace("medical_ops_", "")
             file_ts = datetime.strptime(ts_str, "%Y%m%d_%H%M%S")
             if file_ts < retention_limit:
-                f.unlink()
+                # Instead of unlink(), move to archive
+                dest = archive_dir / f.name
+                f.rename(dest)
                 count += 1
         except (ValueError, OSError):
             mtime = datetime.fromtimestamp(f.stat().st_mtime, tz=None)
             if mtime < retention_limit:
-                f.unlink()
+                dest = archive_dir / f.name
+                f.rename(dest)
                 count += 1
+    
+    # 2. Purge truly ancient archives
+    for f in archive_dir.glob("medical_ops_*.sql"):
+        try:
+            ts_str = f.stem.replace("medical_ops_", "")
+            file_ts = datetime.strptime(ts_str, "%Y%m%d_%H%M%S")
+            if file_ts < purge_limit:
+                f.unlink()
+        except (ValueError, OSError):
+            mtime = datetime.fromtimestamp(f.stat().st_mtime, tz=None)
+            if mtime < purge_limit:
+                f.unlink()
                 
     return count
 
@@ -353,8 +369,13 @@ def prune_old_backups() -> int:
     retry_jitter=True,
     max_retries=3
 )
-def handle_task_timeouts() -> int:
-    db = SessionLocal()
+def handle_task_timeouts(db: Session | None = None) -> int:
+    if db is None:
+        db = SessionLocal()
+        should_close = True
+    else:
+        should_close = False
+
     try:
         now = datetime.utcnow()
         expired_tasks = db.scalars(
@@ -385,8 +406,12 @@ def handle_task_timeouts() -> int:
 
             else:
                 # Default to escalation
+                from app.db.roles import ensure_standard_roles
+                ensure_standard_roles(db)
+                
                 admin_role = db.scalar(select(Role).where(Role.name == RoleType.ADMIN))
                 admin_user = db.scalar(select(User).where(User.org_id == task.org_id, User.role_id == admin_role.id, User.is_active.is_(True))) if admin_role else None
+
                 if admin_user and task.assignee_id != admin_user.id:
                     task.assignee_id = admin_user.id
                     db.add(AuditLog(
@@ -398,7 +423,9 @@ def handle_task_timeouts() -> int:
         db.commit()
         return count
     finally:
-        db.close()
+        if should_close:
+            db.close()
+
 
 
 @celery_app.task(

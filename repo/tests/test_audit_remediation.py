@@ -7,20 +7,17 @@ from app.models.entities import User, Organization, Role, RoleType, Organization
 from app.core.config import settings
 from app.core.security import create_access_token
 
+from sqlalchemy.orm import Session
+
 @pytest.fixture
 def test_setup(db: Session):
-    # Setup roles
+    # Ensure tables are ready and seed permissions
+    from app.db.init_db import init_db
+    init_db(db)
+    
     from app.models.entities import Role, RoleType, Organization, User, OrganizationMembership
     admin_role = db.scalar(select(Role).where(Role.name == RoleType.ADMIN))
-    if not admin_role:
-        admin_role = Role(name=RoleType.ADMIN)
-        db.add(admin_role)
-    
     gen_role = db.scalar(select(Role).where(Role.name == RoleType.GENERAL_USER))
-    if not gen_role:
-        gen_role = Role(name=RoleType.GENERAL_USER)
-        db.add(gen_role)
-    db.commit()
 
     # Setup Org
     org = db.scalar(select(Organization).where(Organization.org_code == "audit_test"))
@@ -31,13 +28,14 @@ def test_setup(db: Session):
         db.refresh(org)
 
     # Setup User
-    user = db.scalar(select(User).where(User.username == "audit_user", User.org_id == org.id))
+    user = db.scalar(select(User).where(User.username == "audit_user"))
     if not user:
+        from app.core.security import get_password_hash
         user = User(
             org_id=org.id,
             role_id=gen_role.id,
             username="audit_user",
-            hashed_password="fake",
+            hashed_password=get_password_hash("password123"),
             is_active=True
         )
         db.add(user)
@@ -50,65 +48,126 @@ def test_setup(db: Session):
         OrganizationMembership.org_id == org.id
     ))
     if not membership:
-        db.add(OrganizationMembership(user_id=user.id, org_id=org.id, is_active=True))
+        db.add(OrganizationMembership(user_id=user.id, org_id=org.id, role_id=gen_role.id, is_active=True))
         db.commit()
 
     return org, user
 
-def test_logout_token_invalidation(db, client, test_setup):
+def test_login_membership_enforcement(db, client, test_setup):
     org, user = test_setup
-    token = create_access_token(subject=str(user.id), org_id=org.id, roles=[RoleType.GENERAL_USER.value])
-    headers = {"Authorization": f"Bearer {token}"}
-
-    # Verify we can access a protected route
-    response = client.get("/api/users/me", headers=headers)
-    assert response.status_code == 200
-
-    # Logout
-    response = client.post("/api/auth/logout", headers=headers)
-    assert response.status_code == 200
-
-    # Verify we can NO LONGER access the route
-    response = client.get("/api/users/me", headers=headers)
-    assert response.status_code == 401
-    assert "invalid" in response.json()["detail"].lower()
-
-def test_password_reset_invalid_token_status(db, client, test_setup):
-    org, user = test_setup
-    payload = {
+    
+    # 1. Successful login
+    response = client.post("/api/auth/login", json={
         "org_code": org.org_code,
-        "token": "invalid-or-expired-token",
-        "new_password": "new_secure_password123"
-    }
-    response = client.post("/api/auth/password-reset/confirm", json=payload)
-    assert response.status_code == 400
-    assert "invalid" in response.json()["detail"].lower()
-
-def test_https_enforcement_in_acceptance(db, client, test_setup, monkeypatch):
-    monkeypatch.setattr("app.main.settings.environment", "acceptance")
-    monkeypatch.setattr("app.main.settings.allow_plain_http", False)
+        "username": user.username,
+        "password": "password123"
+    })
+    assert response.status_code == 200
+    assert "access_token" in response.json()
     
-    # Try access with HTTP (scheme will be http in testclient by default for root_url)
-    response = client.get("/health") 
+    # 2. Login to wrong org (no membership)
+    from app.models.entities import Organization
+    other_org = Organization(org_code="no_member_org", name="No Member")
+    db.add(other_org)
+    db.commit()
     
-    assert response.status_code == 403
-    assert "HTTPS required" in response.json()["detail"]
+    response = client.post("/api/auth/login", json={
+        "org_code": "no_member_org",
+        "username": user.username,
+        "password": "password123"
+    })
+    assert response.status_code == 401
+    assert "member" in response.json()["detail"].lower()
 
-def test_org_join_unauthorized(db, client, test_setup):
+def test_account_lockout_policy(db, client, test_setup):
     org, user = test_setup
+    
+    # Reset attempts
+    user.failed_login_attempts = 0
+    user.locked_until = None
+    db.commit()
+    
+    # 5 Failed attempts
+    for _ in range(5):
+        client.post("/api/auth/login", json={
+            "org_code": org.org_code,
+            "username": user.username,
+            "password": "wrong_password"
+        })
+    
+    # Next attempt should be locked
+    response = client.post("/api/auth/login", json={
+        "org_code": org.org_code,
+        "username": user.username,
+        "password": "password123"
+    })
+    assert response.status_code == 423
+    assert "locked" in response.json()["detail"].lower()
+
+def test_file_validation_magic_numbers(db, client, test_setup):
+    org, user = test_setup
+    from app.models.entities import RoleType
     token = create_access_token(subject=str(user.id), org_id=org.id, roles=[RoleType.GENERAL_USER.value])
     headers = {"Authorization": f"Bearer {token}"}
+    
+    # 1. Valid PDF
+    files = {"upload": ("test.pdf", b"%PDF-1.4\ncontent", "application/pdf")}
+    response = client.post("/api/files/upload", files=files, headers=headers)
+    assert response.status_code == 200
+    
+    # 2. Invalid PDF (Spoofed extension)
+    files = {"upload": ("spoof.pdf", b"NOT-A-PDF", "application/pdf")}
+    response = client.post("/api/files/upload", files=files, headers=headers)
+    assert response.status_code == 400
+    assert "format" in response.json()["detail"].lower()
 
-    # Create another org
-    from app.models.entities import Organization
-    other_org = db.scalar(select(Organization).where(Organization.org_code == "other_org"))
-    if not other_org:
-        other_org = Organization(org_code="other_org", name="Other Org")
-        db.add(other_org)
-        db.commit()
-        db.refresh(other_org)
+def test_object_level_authorization_hospital(db, client, test_setup):
+    org, user = test_setup
+    from app.models.entities import RoleType, Role, RolePermission
+    
+    # Verify permission was seeded by test_setup
+    perm = db.scalar(select(RolePermission).join(Role).where(
+        Role.name == RoleType.GENERAL_USER,
+        RolePermission.resource == "hospital",
+        RolePermission.action == "update"
+    ))
+    assert perm is not None, "Hospital update permission not found for GENERAL_USER"
 
-    # Try to join WITHOUT membership record
-    response = client.post("/api/auth/join-organization", json={"org_code": "other_org"}, headers=headers)
-    assert response.status_code == 403
-    assert "membership" in response.json()["detail"].lower()
+    token = create_access_token(subject=str(user.id), org_id=org.id, roles=[RoleType.GENERAL_USER.value])
+    headers = {"Authorization": f"Bearer {token}"}
+    
+    # Create a patient owned by someone else
+    from app.models.entities import Patient
+    other_patient = Patient(org_id=org.id, user_id=999, full_name="Other Patient")
+    other_patient.patient_number = "PAT-999"
+    db.add(other_patient)
+    db.commit()
+    
+    # Try to update other patient
+    response = client.patch(f"/api/hospital/patients/{other_patient.id}", json={"full_name": "Hack"}, headers=headers)
+    
+    # If it fails with 403, we check the message
+    if response.status_code == 403:
+         detail = response.json()["detail"].lower()
+         # It could be either middleware blocking or our object-level logic
+         assert "own" in detail or "insufficient" in detail
+    else:
+         pytest.fail(f"Expected 403, got {response.status_code}: {response.text}")
+
+def test_audit_traceability_flushing(db, client, test_setup):
+    # This test verifies that log_event gets the ID from a flushed object
+    from app.services.audit_service import log_event
+    from app.models.entities import Attachment
+    
+    org, user = test_setup
+    row = Attachment(org_id=org.id, uploader_id=user.id, filename="trace.txt", sha256="abc", storage_path="/tmp/trace", file_size=100)
+    db.add(row)
+    db.flush()
+    
+    assert row.id is not None
+    log_event(db, org.id, user.id, "test.trace", {"id": row.id})
+    db.commit()
+    
+    from app.models.entities import AuditLog
+    log_entry = db.scalar(select(AuditLog).where(AuditLog.event == "test.trace"))
+    assert log_entry.event_metadata["id"] == row.id

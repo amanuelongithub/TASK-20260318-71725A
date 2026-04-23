@@ -28,7 +28,7 @@ def validate_batch(
     db: Session = Depends(get_db),
     actor: User = Depends(require_permission("data_governance", "write")),
 ) -> dict:
-    return data_governance_service.validate_records(db, actor, payload.batch_id, payload.records)
+    return data_governance_service.validate_records(db, actor, payload.batch_id, payload.records, entity_type=payload.entity_type)
 
 
 @router.post("/rollback")

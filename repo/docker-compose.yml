@@ -20,8 +20,9 @@ services:
       - "5432:5432"
   redis:
     image: redis:7
-    ports:
-      - "6379:6379"
+    # No host port binding — Redis is internal only; worker/beat/api
+    # reach it via the Docker network. Exposing 6379 on the host is
+    # unnecessary and blocked by Windows port reservations on many systems.
   worker:
     build: .
     command: celery -A app.tasks.celery_app:celery_app worker -l info

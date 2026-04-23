@@ -8,9 +8,33 @@ from sqlalchemy.orm import Session
 from app.core.config import settings
 from app.core.security import file_sha256
 from app.models.entities import Attachment, User
+from app.services.audit_service import log_event
 
 
 ALLOWED_MIME_TYPES = {"application/pdf", "image/png", "image/jpeg", "application/json"}
+
+def _validate_content_signature(content: bytes, mime_type: str) -> bool:
+    """Basic magic number validation as required by compliance."""
+    mime_type = mime_type.lower()
+    if mime_type == "application/pdf":
+        return content.startswith(b"%PDF-")
+    if mime_type == "image/png":
+        return content.startswith(b"\x89PNG\r\n\x1a\n")
+    if mime_type == "image/jpeg":
+        return content.startswith(b"\xff\xd8\xff")
+    if mime_type == "application/json":
+        # Support UTF-8 BOM
+        if content.startswith(b"\xef\xbb\xbf"):
+            content = content[3:]
+        stripped = content.lstrip()
+        # Broaden validation to allow objects, arrays, strings, numbers, etc.
+        # Valid JSON starts with one of: { [ " t f n or -0123456789
+        if not stripped:
+            return False
+        first_char = stripped[0:1]
+        return first_char in b"{[\"tfn" or first_char in b"-0123456789"
+    return False
+
 
 async def save_attachment(
     db: Session, 
@@ -18,10 +42,13 @@ async def save_attachment(
     upload: UploadFile, 
     business_owner_id: str | None = None,
     task_id: int | None = None,
-    process_instance_id: int | None = None
+    process_instance_id: int | None = None,
+    entity_type: str | None = None
 ) -> dict:
-    if upload.content_type not in ALLOWED_MIME_TYPES:
+    content_type = upload.content_type.lower() if upload.content_type else ""
+    if content_type not in ALLOWED_MIME_TYPES:
         raise HTTPException(status_code=400, detail="Invalid file format. Allowed: PDF, PNG, JPEG, JSON.")
+
 
     # Validate business owner if provided
     if business_owner_id:
@@ -77,6 +104,13 @@ async def save_attachment(
 
     fingerprint = file_sha256(content)
     
+    # CONTENT-BASED VALIDATION (MAGIC NUMBERS)
+    if not _validate_content_signature(content, content_type):
+         log_event(db, actor.org_id, actor.id, "file.signature_validation_failed", {"filename": upload.filename, "mime": content_type})
+
+         db.commit()
+         raise HTTPException(status_code=400, detail="File content does not match the declared format.")
+    
     # REVISED Traceability Logic:
     # 1. Reuse disk storage path if content exists (Disk Deduplication)
     existing_file = db.scalar(select(Attachment).where(Attachment.sha256 == fingerprint).limit(1))
@@ -103,10 +137,12 @@ async def save_attachment(
         process_instance_id=process_instance_id
     )
     db.add(row)
+    db.flush() # Ensure row.id is populated for audit and traceability link
     
     # NEW: Wire to Data Governance Lifecycle for JSON batches
     validation_status = "not_applicable"
-    if upload.content_type == "application/json" and (upload.filename.startswith("batch") or business_owner_id is not None):
+    if content_type == "application/json" and (upload.filename.startswith("batch") or business_owner_id is not None):
+
         import json
         from app.models.entities import ImportBatch
         from app.services import data_governance_service
@@ -130,14 +166,33 @@ async def save_attachment(
                 db.add(batch)
                 db.commit() # Commit to ensure batch exists for validation service
                 
-                result = data_governance_service.validate_records(db, actor, batch_id, records)
+                # Derive entity_type if not provided
+                if not entity_type and business_owner_id:
+                    if business_owner_id.startswith("EXP-"): entity_type = "expense"
+                    elif business_owner_id.startswith("APT-"): entity_type = "appointment"
+                    elif business_owner_id.startswith("RES-"): entity_type = "resource_application"
+                    elif business_owner_id.startswith("CRD-"): entity_type = "credit_change"
+                    elif business_owner_id.startswith("PAT-"): entity_type = "patient"
+                    elif business_owner_id.startswith("DOC-"): entity_type = "doctor"
+                
+                allowed_existing_business_ids: set[str] = set()
+                if business_owner_id:
+                    allowed_existing_business_ids.add(business_owner_id.strip())
+
+                result = data_governance_service.validate_records(
+                    db,
+                    actor,
+                    batch_id,
+                    records,
+                    entity_type=entity_type or "unknown",
+                    allowed_existing_business_ids=allowed_existing_business_ids,
+                )
                 validation_status = result["status"]
         except Exception as e:
             # We don't want to fail the whole upload if validation fails due to format, 
             # but we should log it.
             validation_status = f"error: {str(e)}"
 
-    from app.services.audit_service import log_event
     log_event(db, actor.org_id, actor.id, "file.uploaded", {"attachment_id": row.id, "filename": row.filename, "sha256": row.sha256})
     db.commit()
     db.refresh(row)

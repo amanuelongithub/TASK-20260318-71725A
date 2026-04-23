@@ -19,6 +19,7 @@ async def upload_file(
     business_owner_id: Optional[str] = Form(None),
     task_id: Optional[int] = Form(None),
     process_instance_id: Optional[int] = Form(None),
+    entity_type: Optional[str] = Form(None),
     db: Session = Depends(get_db),
     actor: User = Depends(require_permission("files", "write")),
 ) -> dict:
@@ -28,7 +29,8 @@ async def upload_file(
         upload, 
         business_owner_id=business_owner_id,
         task_id=task_id,
-        process_instance_id=process_instance_id
+        process_instance_id=process_instance_id,
+        entity_type=entity_type
     )
 
 

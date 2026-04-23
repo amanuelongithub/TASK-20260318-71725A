@@ -16,28 +16,51 @@ depends_on = None
 
 
 def upgrade() -> None:
-    # 1. Create the function
-    op.execute("""
-        CREATE OR REPLACE FUNCTION prevent_audit_log_modification()
-        RETURNS TRIGGER AS $$
-        BEGIN
-            RAISE EXCEPTION 'AuditLog entries are immutable and cannot be modified or deleted.';
-        END;
-        $$ LANGUAGE plpgsql;
-    """)
+    bind = op.get_bind()
+    dialect = bind.dialect.name
 
-    # 2. Add the trigger to audit_logs table
-    op.execute("""
-        CREATE TRIGGER trg_prevent_audit_log_modification
-        BEFORE UPDATE OR DELETE ON audit_logs
-        FOR EACH ROW
-        EXECUTE FUNCTION prevent_audit_log_modification();
-    """)
+    if dialect == "sqlite":
+        op.execute("""
+            CREATE TRIGGER trg_prevent_audit_log_modification_update
+            BEFORE UPDATE ON audit_logs
+            FOR EACH ROW
+            BEGIN
+                SELECT RAISE(ABORT, 'AuditLog entries are immutable and cannot be modified or deleted.');
+            END;
+        """)
+        op.execute("""
+            CREATE TRIGGER trg_prevent_audit_log_modification_delete
+            BEFORE DELETE ON audit_logs
+            FOR EACH ROW
+            BEGIN
+                SELECT RAISE(ABORT, 'AuditLog entries are immutable and cannot be modified or deleted.');
+            END;
+        """)
+    else:
+        op.execute("""
+            CREATE OR REPLACE FUNCTION prevent_audit_log_modification()
+            RETURNS TRIGGER AS $$
+            BEGIN
+                RAISE EXCEPTION 'AuditLog entries are immutable and cannot be modified or deleted.';
+            END;
+            $$ LANGUAGE plpgsql;
+        """)
+
+        op.execute("""
+            CREATE TRIGGER trg_prevent_audit_log_modification
+            BEFORE UPDATE OR DELETE ON audit_logs
+            FOR EACH ROW
+            EXECUTE FUNCTION prevent_audit_log_modification();
+        """)
 
 
 def downgrade() -> None:
-    # 1. Drop trigger
-    op.execute("DROP TRIGGER IF EXISTS trg_prevent_audit_log_modification ON audit_logs;")
-    
-    # 2. Drop function
-    op.execute("DROP FUNCTION IF EXISTS prevent_audit_log_modification();")
+    bind = op.get_bind()
+    dialect = bind.dialect.name
+
+    if dialect == "sqlite":
+        op.execute("DROP TRIGGER IF EXISTS trg_prevent_audit_log_modification_update")
+        op.execute("DROP TRIGGER IF EXISTS trg_prevent_audit_log_modification_delete")
+    else:
+        op.execute("DROP TRIGGER IF EXISTS trg_prevent_audit_log_modification ON audit_logs;")
+        op.execute("DROP FUNCTION IF EXISTS prevent_audit_log_modification();")

@@ -3,6 +3,7 @@ from sqlalchemy.orm import Session
 
 from app.db.base import Base
 from app.db.session import SessionLocal, engine
+from app.db.roles import ensure_standard_roles
 from app.models.entities import Role, RolePermission, RoleType
 
 def init_db(db: Session | None = None) -> None:
@@ -13,42 +14,37 @@ def init_db(db: Session | None = None) -> None:
     else:
         should_close = False
     try:
-        for role_type in RoleType:
-            if db.scalar(select(Role).where(Role.name == role_type)) is None:
-                db.add(Role(name=role_type))
+        ensure_standard_roles(db)
         db.commit()
+
 
         roles = {r.name: r for r in db.scalars(select(Role)).all()}
         mapping = {
             RoleType.ADMIN: [
-                ("process", "create"),
-                ("process", "approve"),
-                ("metrics", "read"),
-                ("audit", "read"),
-                ("export", "create"),
-                ("export", "read"),
-                ("data_governance", "read"),
-                ("data_governance", "write"),
-                ("hospital", "read"),
-                ("hospital", "create"),
-                ("hospital", "update"),
-                ("files", "read"),
-                ("files", "write"),
-                ("org", "read"),
-                ("org", "update"),
+                ("process", "create"), ("process", "approve"), ("process", "admin"),
+                ("metrics", "read"), ("audit", "read"),
+                ("export", "create"), ("export", "read"),
+                ("data_governance", "read"), ("data_governance", "write"),
+                ("hospital", "read"), ("hospital", "create"), ("hospital", "update"), ("hospital", "delete"),
+                ("files", "read"), ("files", "write"),
+                ("org", "read"), ("org", "update"),
                 ("membership", "write"),
                 ("dictionary", "read"),
             ],
-            RoleType.REVIEWER: [("process", "approve"), ("metrics", "read"), ("hospital", "read"), ("hospital", "create"), ("hospital", "update"), ("files", "read"), ("dictionary", "read")],
-            RoleType.GENERAL_USER: [("process", "create"), ("metrics", "read"), ("hospital", "read"), ("hospital", "create"), ("hospital", "update"), ("files", "read"), ("files", "write"), ("dictionary", "read")],
+            RoleType.REVIEWER: [
+                ("process", "approve"), ("metrics", "read"),
+                ("hospital", "read"), ("hospital", "update"), 
+                ("files", "read"), ("dictionary", "read")
+            ],
+            RoleType.GENERAL_USER: [
+                ("process", "create"), ("metrics", "read"),
+                ("hospital", "read"), ("hospital", "create"), ("hospital", "update"),
+                ("files", "read"), ("files", "write"), ("dictionary", "read")
+            ],
             RoleType.AUDITOR: [
-                ("audit", "read"),
-                ("metrics", "read"),
-                ("hospital", "read"),
-                ("data_governance", "read"),
-                ("export", "read"),
-                ("files", "read"),
-                ("dictionary", "read"),
+                ("audit", "read"), ("metrics", "read"),
+                ("hospital", "read"), ("data_governance", "read"),
+                ("export", "read"), ("files", "read"), ("dictionary", "read")
             ],
         }
 

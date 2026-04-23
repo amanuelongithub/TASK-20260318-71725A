@@ -1,0 +1,32 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Environment
+.env
+.env.test
+
+# Certificates and Secrets (Audit Compliance)
+deploy/certs/*.key
+deploy/certs/*.crt
+deploy/certs/*.pem
+
+# Storage
+storage/
+/app/storage/
+
+# IDEs
+.vscode/
+.idea/
+
+# Test output artifacts
+tests/*.txt
+tests/repro_*.py
+
+# Celery
+celerybeat-schedule
+celerybeat.pid

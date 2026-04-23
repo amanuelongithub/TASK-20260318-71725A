@@ -86,21 +86,45 @@ def mask_value(field: str, value: Any) -> str:
     return text
 
 
-def desensitize_response(data: Any, role_name: str | None) -> Any:
+def desensitize_response(data: Any, role_name: Any) -> Any:
     from app.models.entities import RoleType
     # ADMINs see everything cleartext in the API
-    if role_name == RoleType.ADMIN.value:
+    # Some roles might be passed as string values or Enum members
+    role_str = str(role_name.value if hasattr(role_name, "value") else role_name)
+    if role_str == RoleType.ADMIN.value:
         return data
     
     sensitive_fields = {
         "full_name", "email", "username", "phone_number", "id_card_num", 
         "license_number", "patient_number", "appointment_number", "expense_number",
-        "notes", "comment"
+        "notes", "comment", "email_encrypted", "id_card_num_encrypted", "phone_number_encrypted"
     }
     
+    if data is None:
+        return None
+
     if isinstance(data, list):
         return [desensitize_response(item, role_name) for item in data]
     
+    # Handle Pydantic models (v1/v2)
+    if hasattr(data, "model_dump"): # Pydantic v2
+        data_dict = data.model_dump()
+        return desensitize_response(data_dict, role_name)
+    if hasattr(data, "dict"): # Pydantic v1
+        data_dict = data.dict()
+        return desensitize_response(data_dict, role_name)
+    if hasattr(data, "__dict__"):
+        # SQLAlchemy models or other objects. 
+        # Start with __dict__ to get columns/state.
+        obj_dict = {k: v for k, v in data.__dict__.items() if not k.startswith("_")}
+        
+        # Explicitly add sensitive properties that might be @property (unindexed by __dict__)
+        for field in sensitive_fields:
+            if field not in obj_dict and hasattr(data, field):
+                obj_dict[field] = getattr(data, field)
+                
+        return desensitize_response(obj_dict, role_name)
+
     if isinstance(data, dict):
         new_dict = {}
         for k, v in data.items():
@@ -110,10 +134,5 @@ def desensitize_response(data: Any, role_name: str | None) -> Any:
                 new_dict[k] = desensitize_response(v, role_name)
         return new_dict
     
-    if hasattr(data, "__dict__") or hasattr(data, "dict"):
-        # Handle Pydantic or SQLAlchemy objects
-        obj_dict = data.dict() if hasattr(data, "dict") else {k: v for k, v in data.__dict__.items() if not k.startswith("_")}
-        return desensitize_response(obj_dict, role_name)
-        
     return data
 

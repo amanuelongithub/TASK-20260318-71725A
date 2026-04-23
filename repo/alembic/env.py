@@ -8,7 +8,11 @@ from app.db.base import Base
 from app.models import entities  # noqa: F401
 
 config = context.config
-config.set_main_option("sqlalchemy.url", settings.database_url)
+
+# Allow callers such as the test suite to override the target DB explicitly.
+configured_url = config.get_main_option("sqlalchemy.url")
+if not configured_url:
+    config.set_main_option("sqlalchemy.url", settings.database_url)
 
 if config.config_file_name is not None:
     fileConfig(config.config_file_name)

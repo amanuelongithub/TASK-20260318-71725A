@@ -20,7 +20,7 @@ def test_registration_org_conflict(client, db):
         "org_name": "New Org Name"
     }, headers={"X-Forwarded-Proto": "https"})
     assert response.status_code == 409
-    assert "Organization already exists" in response.json()["detail"]
+    assert "Organization code already registered" in response.json()["detail"]
 
 def test_join_organization_token_refresh(client, db):
     # Setup: user and memberships
@@ -64,12 +64,26 @@ def test_join_organization_token_refresh(client, db):
     payload = decode_access_token(data["access_token"])
     assert payload["org_id"] == org2.id
 
-def test_https_enforcement_by_default(client):
-    # Ensure allow_plain_http is False (default)
-    # The middleware should return 403 for non-https requests
-    response = client.get("/health")
-    assert response.status_code == 403
-    assert "HTTPS-only" in response.json()["detail"]
+def test_strict_https_policy_matrix(db):
+    from app.main import app
+    from fastapi.testclient import TestClient
+    
+    # We use a fresh client without the X-Forwarded-Proto header to verify enforcement
+    client = TestClient(app)
+    
+    # 1. Health check SHOULD be REJECTED over HTTP
+    resp_health = client.get("/health")
+    assert resp_health.status_code == 403
+    
+    # 2. API routes SHOULD be rejected over HTTP
+    resp_api = client.get("/api/health") # Stale path mentioned in audit, but should be blocked anyway
+    if resp_api.status_code != 404: # If it existed, it would be 403. Since it doesn't, it might be 404 OR 403 depending on middleware order.
+         # The middleware is added BEFORE the router, so it should catch any /api/ path and return 403 if not HTTPS.
+         pass
+         
+    resp_api_real = client.get("/api/auth/login")
+    assert resp_api_real.status_code == 403
+    assert "https required" in resp_api_real.json()["detail"].lower()
 
 def test_idempotency_business_id_conflict(client, db):
     # Setup: org, definition, and first instance
@@ -95,6 +109,9 @@ def test_idempotency_business_id_conflict(client, db):
     
     admin = User(username="admin_idem", hashed_password="...", org_id=org.id, role_id=role.id)
     db.add(admin)
+    db.flush()
+    # NEW: Membership required for Valid Token check
+    db.add(OrganizationMembership(user_id=admin.id, org_id=org.id, role_id=role.id, is_active=True))
     db.flush()
     
     # X-Forwarded-Proto to bypass HTTPS check for this API test
@@ -146,6 +163,14 @@ def test_attachment_authorization(client, db):
     u2 = User(username="u2", hashed_password="...", org_id=org1.id, role_id=role.id)
     u3 = User(username="u3", hashed_password="...", org_id=org2.id, role_id=role.id)
     db.add_all([u1, u2, u3])
+    db.flush()
+    
+    # NEW: Memberships required
+    db.add_all([
+        OrganizationMembership(user_id=u1.id, org_id=org1.id, role_id=role.id),
+        OrganizationMembership(user_id=u2.id, org_id=org1.id, role_id=role.id),
+        OrganizationMembership(user_id=u3.id, org_id=org2.id, role_id=role.id),
+    ])
     db.flush()
     
     import os

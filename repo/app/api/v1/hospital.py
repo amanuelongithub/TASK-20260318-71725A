@@ -2,16 +2,19 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 from typing import List
+from datetime import datetime
 
+from app.core.security import desensitize_response, deterministic_hash
 from app.db.session import get_db
-from app.middleware.auth import require_permission
+from app.middleware.auth import require_permission, AuthenticatedActor
 from app.models.entities import User, Patient, Doctor, Appointment, Expense, ResourceApplication, CreditChange
 from app.schemas.hospital import (
     PatientCreate, PatientUpdate, PatientOut,
     DoctorCreate, DoctorUpdate, DoctorOut,
     AppointmentCreate, AppointmentUpdate, AppointmentOut,
     ExpenseCreate, ExpenseUpdate, ExpenseOut,
-    ResourceApplicationCreate, ResourceApplicationUpdate, ResourceApplicationOut,
+    ResourceApplicationOut,
+    ResourceApplicationCreate, ResourceApplicationUpdate,
     CreditChangeCreate, CreditChangeUpdate, CreditChangeOut
 )
 
@@ -27,8 +30,9 @@ def create_patient(
 ):
     # Cross-org validation for user_id linkage
     if payload.user_id:
-        target_user = db.scalar(select(User).where(User.id == payload.user_id, User.org_id == actor.org_id))
-        if not target_user:
+        from app.models.entities import OrganizationMembership
+        is_member = OrganizationMembership.is_user_active_in_org(db, payload.user_id, actor.org_id)
+        if not is_member:
             raise HTTPException(status_code=400, detail="Linked user must belong to the same organization")
 
     # Using model properties for encryption is automatic via setters in Patient model
@@ -37,12 +41,13 @@ def create_patient(
         patient_number=payload.patient_number,
         full_name=payload.full_name,
         dob=payload.dob,
+        phone_number=payload.phone_number,
         user_id=payload.user_id
     )
     db.add(item)
     db.commit()
     db.refresh(item)
-    return item
+    return desensitize_response(item, actor.role.name)
 
 @router.patch("/patients/{patient_id}", response_model=PatientOut)
 def update_patient(
@@ -55,24 +60,65 @@ def update_patient(
     if not item:
         raise HTTPException(status_code=404, detail="Patient not found")
     
+    # OBJECT-LEVEL AUTHORIZATION
+    from app.models.entities import RoleType
+    is_admin_or_reviewer = actor.role.name in {RoleType.ADMIN, RoleType.REVIEWER}
+    is_owner = (item.user_id == actor.id)
+    
+    if not is_admin_or_reviewer and not is_owner:
+        raise HTTPException(status_code=403, detail="Forbidden: You can only update your own patient record.")
+    
     if payload.full_name is not None: item.full_name = payload.full_name
     if payload.dob is not None: item.dob = payload.dob
+    if payload.phone_number is not None: item.phone_number = payload.phone_number
     if payload.user_id is not None:
-        target_user = db.scalar(select(User).where(User.id == payload.user_id, User.org_id == actor.org_id))
-        if not target_user:
+        from app.models.entities import OrganizationMembership
+        is_member = OrganizationMembership.is_user_active_in_org(db, payload.user_id, actor.org_id)
+        if not is_member:
             raise HTTPException(status_code=400, detail="Linked user must belong to the same organization")
         item.user_id = payload.user_id
 
     db.commit()
     db.refresh(item)
-    return item
+    return desensitize_response(item, actor.role.name)
 
 @router.get("/patients", response_model=List[PatientOut])
 def list_patients(
+    patient_number: str | None = Query(None),
+    full_name: str | None = Query(None),
+    dob_start: datetime | None = Query(None),
+    dob_end: datetime | None = Query(None),
+    user_id: int | None = Query(None),
+    limit: int = Query(20, ge=1, le=100),
+    offset: int = Query(0, ge=0),
+    sort_by: str = Query("created_at"),
+    order: str = Query("desc", regex="^(asc|desc)$"),
     db: Session = Depends(get_db),
-    actor: User = Depends(require_permission("hospital", "read"))
+    actor: AuthenticatedActor = Depends(require_permission("hospital", "read"))
 ):
-    return db.scalars(select(Patient).where(Patient.org_id == actor.org_id)).all()
+    from sqlalchemy import asc, desc
+    stmt = select(Patient).where(Patient.org_id == actor.org_id)
+    
+    if patient_number:
+        stmt = stmt.where(Patient.patient_number_hash == deterministic_hash(patient_number))
+    if full_name:
+        stmt = stmt.where(Patient.full_name.ilike(f"%{full_name}%"))
+    if dob_start:
+        stmt = stmt.where(Patient.dob >= dob_start)
+    if dob_end:
+        stmt = stmt.where(Patient.dob <= dob_end)
+    if user_id:
+        stmt = stmt.where(Patient.user_id == user_id)
+        
+    # Sorting logic
+    col = getattr(Patient, sort_by, Patient.created_at)
+    stmt = stmt.order_by(asc(col) if order == "asc" else desc(col))
+    
+    # Pagination
+    stmt = stmt.offset(offset).limit(limit)
+    
+    results = db.scalars(stmt).all()
+    return desensitize_response(results, actor.role.name)
 
 
 # --- DOCTORS ---
@@ -84,8 +130,9 @@ def create_doctor(
     actor: User = Depends(require_permission("hospital", "create"))
 ):
     if payload.user_id:
-        target_user = db.scalar(select(User).where(User.id == payload.user_id, User.org_id == actor.org_id))
-        if not target_user:
+        from app.models.entities import OrganizationMembership
+        is_member = OrganizationMembership.is_user_active_in_org(db, payload.user_id, actor.org_id)
+        if not is_member:
             raise HTTPException(status_code=400, detail="Linked user must belong to the same organization")
 
     item = Doctor(
@@ -99,7 +146,7 @@ def create_doctor(
     db.add(item)
     db.commit()
     db.refresh(item)
-    return item
+    return desensitize_response(item, actor.role.name)
 
 @router.patch("/doctors/{doctor_id}", response_model=DoctorOut)
 def update_doctor(
@@ -111,26 +158,63 @@ def update_doctor(
     item = db.scalar(select(Doctor).where(Doctor.id == doctor_id, Doctor.org_id == actor.org_id))
     if not item:
         raise HTTPException(status_code=404, detail="Doctor not found")
+        
+    # OBJECT-LEVEL AUTHORIZATION
+    from app.models.entities import RoleType
+    is_admin_or_reviewer = actor.role.name in {RoleType.ADMIN, RoleType.REVIEWER}
+    is_owner = (item.user_id == actor.id)
+    
+    if not is_admin_or_reviewer and not is_owner:
+        raise HTTPException(status_code=403, detail="Forbidden: You can only update your own doctor record.")
     
     if payload.full_name is not None: item.full_name = payload.full_name
     if payload.specialty is not None: item.specialty = payload.specialty
     if payload.is_active is not None: item.is_active = payload.is_active
     if payload.user_id is not None:
-        target_user = db.scalar(select(User).where(User.id == payload.user_id, User.org_id == actor.org_id))
-        if not target_user:
+        from app.models.entities import OrganizationMembership
+        is_member = OrganizationMembership.is_user_active_in_org(db, payload.user_id, actor.org_id)
+        if not is_member:
             raise HTTPException(status_code=400, detail="Linked user must belong to the same organization")
         item.user_id = payload.user_id
 
     db.commit()
     db.refresh(item)
-    return item
+    return desensitize_response(item, actor.role.name)
 
 @router.get("/doctors", response_model=List[DoctorOut])
 def list_doctors(
+    license_number: str | None = Query(None),
+    full_name: str | None = Query(None),
+    specialty: str | None = Query(None),
+    is_active: bool | None = Query(None),
+    user_id: int | None = Query(None),
+    limit: int = Query(20, ge=1, le=100),
+    offset: int = Query(0, ge=0),
+    sort_by: str = Query("created_at"),
+    order: str = Query("desc", regex="^(asc|desc)$"),
     db: Session = Depends(get_db),
-    actor: User = Depends(require_permission("hospital", "read"))
+    actor: AuthenticatedActor = Depends(require_permission("hospital", "read"))
 ):
-    return db.scalars(select(Doctor).where(Doctor.org_id == actor.org_id)).all()
+    from sqlalchemy import asc, desc
+    stmt = select(Doctor).where(Doctor.org_id == actor.org_id)
+    
+    if license_number:
+        stmt = stmt.where(Doctor.license_number_hash == deterministic_hash(license_number))
+    if full_name:
+        stmt = stmt.where(Doctor.full_name.ilike(f"%{full_name}%"))
+    if specialty:
+        stmt = stmt.where(Doctor.specialty.ilike(f"%{specialty}%"))
+    if is_active is not None:
+        stmt = stmt.where(Doctor.is_active == is_active)
+    if user_id:
+        stmt = stmt.where(Doctor.user_id == user_id)
+        
+    col = getattr(Doctor, sort_by, Doctor.created_at)
+    stmt = stmt.order_by(asc(col) if order == "asc" else desc(col))
+    stmt = stmt.offset(offset).limit(limit)
+    
+    results = db.scalars(stmt).all()
+    return desensitize_response(results, actor.role.name)
 
 
 # --- APPOINTMENTS ---
@@ -159,7 +243,7 @@ def create_appointment(
     db.add(item)
     db.commit()
     db.refresh(item)
-    return item
+    return desensitize_response(item, actor.role.name)
 
 @router.patch("/appointments/{appointment_id}", response_model=AppointmentOut)
 def update_appointment(
@@ -171,6 +255,18 @@ def update_appointment(
     item = db.scalar(select(Appointment).where(Appointment.id == appointment_id, Appointment.org_id == actor.org_id))
     if not item:
         raise HTTPException(status_code=404, detail="Appointment not found")
+
+    # OBJECT-LEVEL AUTHORIZATION
+    from app.models.entities import RoleType, Patient, Doctor
+    is_admin_or_reviewer = actor.role.name in {RoleType.ADMIN, RoleType.REVIEWER}
+    
+    # Check if actor is the patient or doctor in this appointment
+    patient = db.scalar(select(Patient).where(Patient.id == item.patient_id))
+    doctor = db.scalar(select(Doctor).where(Doctor.id == item.doctor_id))
+    is_involved = (patient and patient.user_id == actor.id) or (doctor and doctor.user_id == actor.id)
+    
+    if not is_admin_or_reviewer and not is_involved:
+        raise HTTPException(status_code=403, detail="Forbidden: You must be the doctor or patient of this appointment to update it.")
 
     if payload.patient_id:
         p = db.scalar(select(Patient).where(Patient.id == payload.patient_id, Patient.org_id == actor.org_id))
@@ -188,18 +284,45 @@ def update_appointment(
 
     db.commit()
     db.refresh(item)
-    return item
+    return desensitize_response(item, actor.role.name)
 
 @router.get("/appointments", response_model=List[AppointmentOut])
 def list_appointments(
+    appointment_number: str | None = Query(None),
+    patient_id: int | None = Query(None),
+    doctor_id: int | None = Query(None),
     status: str | None = Query(None),
+    scheduled_start: datetime | None = Query(None),
+    scheduled_end: datetime | None = Query(None),
+    limit: int = Query(20, ge=1, le=100),
+    offset: int = Query(0, ge=0),
+    sort_by: str = Query("scheduled_time"),
+    order: str = Query("desc", regex="^(asc|desc)$"),
     db: Session = Depends(get_db),
-    actor: User = Depends(require_permission("hospital", "read"))
+    actor: AuthenticatedActor = Depends(require_permission("hospital", "read"))
 ):
+    from sqlalchemy import asc, desc
     stmt = select(Appointment).where(Appointment.org_id == actor.org_id)
+    
+    if appointment_number:
+        stmt = stmt.where(Appointment.appointment_number == appointment_number)
+    if patient_id:
+        stmt = stmt.where(Appointment.patient_id == patient_id)
+    if doctor_id:
+        stmt = stmt.where(Appointment.doctor_id == doctor_id)
     if status:
         stmt = stmt.where(Appointment.status == status)
-    return db.scalars(stmt).all()
+    if scheduled_start:
+        stmt = stmt.where(Appointment.scheduled_time >= scheduled_start)
+    if scheduled_end:
+        stmt = stmt.where(Appointment.scheduled_time <= scheduled_end)
+        
+    col = getattr(Appointment, sort_by, Appointment.scheduled_time)
+    stmt = stmt.order_by(asc(col) if order == "asc" else desc(col))
+    stmt = stmt.offset(offset).limit(limit)
+    
+    results = db.scalars(stmt).all()
+    return desensitize_response(results, actor.role.name)
 
 
 # --- EXPENSES ---
@@ -222,7 +345,7 @@ def create_expense(
     db.add(item)
     db.commit()
     db.refresh(item)
-    return item
+    return desensitize_response(item, actor.role.name)
 
 @router.patch("/expenses/{expense_id}", response_model=ExpenseOut)
 def update_expense(
@@ -235,6 +358,14 @@ def update_expense(
     if not item:
         raise HTTPException(status_code=404, detail="Expense not found")
 
+    # OBJECT-LEVEL AUTHORIZATION
+    from app.models.entities import RoleType
+    is_admin_or_reviewer = actor.role.name in {RoleType.ADMIN, RoleType.REVIEWER}
+    is_owner = (item.submitted_by == actor.id)
+    
+    if not is_admin_or_reviewer and not is_owner:
+        raise HTTPException(status_code=403, detail="Forbidden: You can only update your own expense reports.")
+
     if payload.amount is not None: item.amount = payload.amount
     if payload.category is not None: item.category = payload.category
     if payload.status is not None: item.status = payload.status
@@ -242,14 +373,45 @@ def update_expense(
 
     db.commit()
     db.refresh(item)
-    return item
+    return desensitize_response(item, actor.role.name)
 
 @router.get("/expenses", response_model=List[ExpenseOut])
 def list_expenses(
+    expense_number: str | None = Query(None),
+    category: str | None = Query(None),
+    status: str | None = Query(None),
+    min_amount: float | None = Query(None),
+    max_amount: float | None = Query(None),
+    submitted_by: int | None = Query(None),
+    limit: int = Query(20, ge=1, le=100),
+    offset: int = Query(0, ge=0),
+    sort_by: str = Query("created_at"),
+    order: str = Query("desc", regex="^(asc|desc)$"),
     db: Session = Depends(get_db),
-    actor: User = Depends(require_permission("hospital", "read"))
+    actor: AuthenticatedActor = Depends(require_permission("hospital", "read"))
 ):
-    return db.scalars(select(Expense).where(Expense.org_id == actor.org_id)).all()
+    from sqlalchemy import asc, desc
+    stmt = select(Expense).where(Expense.org_id == actor.org_id)
+    
+    if expense_number:
+        stmt = stmt.where(Expense.expense_number == expense_number)
+    if category:
+        stmt = stmt.where(Expense.category.ilike(f"%{category}%"))
+    if status:
+        stmt = stmt.where(Expense.status == status)
+    if min_amount is not None:
+        stmt = stmt.where(Expense.amount >= min_amount)
+    if max_amount is not None:
+        stmt = stmt.where(Expense.amount <= max_amount)
+    if submitted_by:
+        stmt = stmt.where(Expense.submitted_by == submitted_by)
+        
+    col = getattr(Expense, sort_by, Expense.created_at)
+    stmt = stmt.order_by(asc(col) if order == "asc" else desc(col))
+    stmt = stmt.offset(offset).limit(limit)
+    
+    results = db.scalars(stmt).all()
+    return desensitize_response(results, actor.role.name)
 
 
 # --- RESOURCE APPLICATIONS ---
@@ -271,7 +433,7 @@ def create_resource_application(
     db.add(item)
     db.commit()
     db.refresh(item)
-    return item
+    return desensitize_response(item, actor.role.name)
 
 @router.patch("/resource-applications/{application_id}", response_model=ResourceApplicationOut)
 def update_resource_application(
@@ -284,24 +446,52 @@ def update_resource_application(
     if not item:
         raise HTTPException(status_code=404, detail="Resource Application not found")
 
+    # OBJECT-LEVEL AUTHORIZATION
+    from app.models.entities import RoleType
+    is_admin_or_reviewer = actor.role.name in {RoleType.ADMIN, RoleType.REVIEWER}
+    is_owner = (item.applicant_id == actor.id)
+    
+    if not is_admin_or_reviewer and not is_owner:
+        raise HTTPException(status_code=403, detail="Forbidden: You can only update your own resource applications.")
+
     if payload.resource_name is not None: item.resource_name = payload.resource_name
     if payload.quantity is not None: item.quantity = payload.quantity
     if payload.status is not None: item.status = payload.status
 
     db.commit()
     db.refresh(item)
-    return item
+    return desensitize_response(item, actor.role.name)
 
 @router.get("/resource-applications", response_model=List[ResourceApplicationOut])
 def list_resource_applications(
+    application_number: str | None = Query(None),
+    resource_name: str | None = Query(None),
     status: str | None = Query(None),
+    applicant_id: int | None = Query(None),
+    limit: int = Query(20, ge=1, le=100),
+    offset: int = Query(0, ge=0),
+    sort_by: str = Query("created_at"),
+    order: str = Query("desc", regex="^(asc|desc)$"),
     db: Session = Depends(get_db),
-    actor: User = Depends(require_permission("hospital", "read"))
+    actor: AuthenticatedActor = Depends(require_permission("hospital", "read"))
 ):
+    from sqlalchemy import asc, desc
     stmt = select(ResourceApplication).where(ResourceApplication.org_id == actor.org_id)
+    if application_number:
+        stmt = stmt.where(ResourceApplication.application_number == application_number)
+    if resource_name:
+        stmt = stmt.where(ResourceApplication.resource_name.ilike(f"%{resource_name}%"))
     if status:
         stmt = stmt.where(ResourceApplication.status == status)
-    return db.scalars(stmt).all()
+    if applicant_id:
+        stmt = stmt.where(ResourceApplication.applicant_id == applicant_id)
+        
+    col = getattr(ResourceApplication, sort_by, ResourceApplication.created_at)
+    stmt = stmt.order_by(asc(col) if order == "asc" else desc(col))
+    stmt = stmt.offset(offset).limit(limit)
+    
+    results = db.scalars(stmt).all()
+    return desensitize_response(results, actor.role.name)
 
 
 # --- CREDIT CHANGES ---
@@ -313,8 +503,9 @@ def create_credit_change(
     actor: User = Depends(require_permission("hospital", "create"))
 ):
     # CROSS-ENTITY ORG CHECK: target_user_id must be org-scoped
-    target_user = db.scalar(select(User).where(User.id == payload.target_user_id, User.org_id == actor.org_id))
-    if not target_user:
+    from app.models.entities import OrganizationMembership
+    is_member = OrganizationMembership.is_user_active_in_org(db, payload.target_user_id, actor.org_id)
+    if not is_member:
          raise HTTPException(status_code=400, detail="Target user must belong to your organization")
 
     item = CreditChange(
@@ -328,7 +519,7 @@ def create_credit_change(
     db.add(item)
     db.commit()
     db.refresh(item)
-    return item
+    return desensitize_response(item, actor.role.name)
 
 @router.patch("/credit-changes/{change_id}", response_model=CreditChangeOut)
 def update_credit_change(
@@ -341,9 +532,18 @@ def update_credit_change(
     if not item:
         raise HTTPException(status_code=404, detail="Credit Change not found")
 
+    # OBJECT-LEVEL AUTHORIZATION
+    from app.models.entities import RoleType
+    is_admin_or_reviewer = actor.role.name in {RoleType.ADMIN, RoleType.REVIEWER}
+    is_owner = (item.target_user_id == actor.id)
+    
+    if not is_admin_or_reviewer and not is_owner:
+        raise HTTPException(status_code=403, detail="Forbidden: You can only update your own credit change records.")
+
     if payload.target_user_id:
-        u = db.scalar(select(User).where(User.id == payload.target_user_id, User.org_id == actor.org_id))
-        if not u: raise HTTPException(status_code=400, detail="Invalid target_user_id")
+        from app.models.entities import OrganizationMembership
+        is_member = OrganizationMembership.is_user_active_in_org(db, payload.target_user_id, actor.org_id)
+        if not is_member: raise HTTPException(status_code=400, detail="Invalid target_user_id")
         item.target_user_id = payload.target_user_id
 
     if payload.amount is not None: item.amount = payload.amount
@@ -352,11 +552,38 @@ def update_credit_change(
 
     db.commit()
     db.refresh(item)
-    return item
+    return desensitize_response(item, actor.role.name)
 
 @router.get("/credit-changes", response_model=List[CreditChangeOut])
 def list_credit_changes(
+    change_number: str | None = Query(None),
+    target_user_id: int | None = Query(None),
+    status: str | None = Query(None),
+    min_amount: float | None = Query(None),
+    max_amount: float | None = Query(None),
+    limit: int = Query(20, ge=1, le=100),
+    offset: int = Query(0, ge=0),
+    sort_by: str = Query("created_at"),
+    order: str = Query("desc", regex="^(asc|desc)$"),
     db: Session = Depends(get_db),
-    actor: User = Depends(require_permission("hospital", "read"))
+    actor: AuthenticatedActor = Depends(require_permission("hospital", "read"))
 ):
-    return db.scalars(select(CreditChange).where(CreditChange.org_id == actor.org_id)).all()
+    from sqlalchemy import asc, desc
+    stmt = select(CreditChange).where(CreditChange.org_id == actor.org_id)
+    if change_number:
+        stmt = stmt.where(CreditChange.change_number == change_number)
+    if target_user_id:
+        stmt = stmt.where(CreditChange.target_user_id == target_user_id)
+    if status:
+        stmt = stmt.where(CreditChange.status == status)
+    if min_amount is not None:
+        stmt = stmt.where(CreditChange.amount >= min_amount)
+    if max_amount is not None:
+        stmt = stmt.where(CreditChange.amount <= max_amount)
+        
+    col = getattr(CreditChange, sort_by, CreditChange.created_at)
+    stmt = stmt.order_by(asc(col) if order == "asc" else desc(col))
+    stmt = stmt.offset(offset).limit(limit)
+    
+    results = db.scalars(stmt).all()
+    return desensitize_response(results, actor.role.name)

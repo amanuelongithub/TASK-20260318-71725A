@@ -136,7 +136,10 @@ def upgrade() -> None:
     op.add_column('users', sa.Column('phone_number_encrypted', sa.LargeBinary(), nullable=True))
     op.add_column('users', sa.Column('last_failed_login', sa.DateTime(), nullable=True))
     op.drop_index(op.f('ix_users_reset_token'), table_name='users')
-    op.drop_constraint(op.f('uq_users_username'), 'users', type_='unique')
+    if op.get_bind().dialect.name == 'sqlite':
+        op.execute(f"DROP INDEX IF EXISTS {op.f('uq_users_username')}")
+    else:
+        op.drop_constraint(op.f('uq_users_username'), 'users', type_='unique')
     op.create_index(op.f('ix_users_org_id'), 'users', ['org_id'], unique=False)
     op.create_index(op.f('ix_users_role_id'), 'users', ['role_id'], unique=False)
     op.create_index(op.f('ix_users_username'), 'users', ['username'], unique=True)

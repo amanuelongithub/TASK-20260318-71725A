@@ -17,6 +17,8 @@ depends_on = None
 
 
 def upgrade() -> None:
+    dialect = op.get_bind().dialect.name
+
     # 1. Create token_blacklist
     op.create_table(
         'token_blacklist',
@@ -50,12 +52,14 @@ def upgrade() -> None:
     # 3. Update Patients
     op.add_column('patients', sa.Column('user_id', sa.Integer(), nullable=True))
     op.create_index(op.f('ix_patients_user_id'), 'patients', ['user_id'], unique=False)
-    op.create_foreign_key(op.f('patients_user_id_fkey'), 'patients', 'users', ['user_id'], ['id'])
+    if dialect != 'sqlite':
+        op.create_foreign_key(op.f('patients_user_id_fkey'), 'patients', 'users', ['user_id'], ['id'])
 
     # 4. Update Doctors
     op.add_column('doctors', sa.Column('user_id', sa.Integer(), nullable=True))
     op.create_index(op.f('ix_doctors_user_id'), 'doctors', ['user_id'], unique=False)
-    op.create_foreign_key(op.f('doctors_user_id_fkey'), 'doctors', 'users', ['user_id'], ['id'])
+    if dialect != 'sqlite':
+        op.create_foreign_key(op.f('doctors_user_id_fkey'), 'doctors', 'users', ['user_id'], ['id'])
 
 
 def downgrade() -> None:
